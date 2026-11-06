@@ -9,7 +9,6 @@
     "node": ">=18"
   },
   "dependencies": {
-    "discord.js": "^14.22.0",
-    "mongodb": "^6.9.0"
+    "discord.js": "^14.22.0"
   }
 }
