@@ -7,13 +7,11 @@ const {
   ChannelType,
   PermissionFlagsBits,
 } = require('discord.js');
-const { MongoClient } = require('mongodb');
 
 // ================== AYARLAR (Render'da Environment Variables) ==================
 const {
   DISCORD_TOKEN,
   GUILD_ID,
-  MONGO_URI,
   TESTER_ROLE_ID,
   RESULT_CHANNEL_ID,
   TICKET_CATEGORY_ID,
@@ -59,38 +57,27 @@ const commands = [
 ].map((c) => c.toJSON());
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-let queue, tiers;
+
+// Bellekte tutulan veriler (bot yeniden başlarsa sıfırlanır)
+const queue = []; // { userId, kit, nick, joined }
+const cooldowns = new Map(); // "userId:kit" -> bitiş zamanı (ms)
 
 const testerMi = (member) => member.roles.cache.has(TESTER_ROLE_ID);
 
-async function kalanCooldown(userId, kit) {
-  const kayit = await tiers.findOne({ userId, kit });
-  if (!kayit) return null;
-  const bitis = kayit.testedAt + COOLDOWN_GUN * 86400000;
-  if (Date.now() < bitis) return Math.ceil((bitis - Date.now()) / 86400000);
+function kalanCooldown(userId, kit) {
+  const bitis = cooldowns.get(`${userId}:${kit}`);
+  if (bitis && Date.now() < bitis) return Math.ceil((bitis - Date.now()) / 86400000);
   return null;
 }
 
 client.once('clientReady', async () => {
-  // --- MONGO KONTROL (şifreyi yazdırmaz, sadece uzunluğunu gösterir) ---
   try {
-    const u = new URL(MONGO_URI);
-    console.log('MONGO kullanici:', u.username, '| sifre uzunlugu:', u.password.length, '| host:', u.hostname);
+    const guild = await client.guilds.fetch(GUILD_ID);
+    await guild.commands.set(commands);
+    console.log(`${client.user.tag} hazır, komutlar kaydedildi.`);
   } catch (e) {
-    console.log('MONGO_URI okunamadi veya bos:', typeof MONGO_URI);
+    console.log('KOMUT KAYIT HATASI:', e.message);
   }
-
-  const mongo = new MongoClient(MONGO_URI);
-  await mongo.connect();
-  const db = mongo.db('tiertest');
-  queue = db.collection('queue');
-  tiers = db.collection('tiers');
-  await queue.createIndex({ userId: 1, kit: 1 }, { unique: true });
-  await tiers.createIndex({ userId: 1, kit: 1 }, { unique: true });
-
-  const guild = await client.guilds.fetch(GUILD_ID);
-  await guild.commands.set(commands);
-  console.log(`${client.user.tag} hazır.`);
 });
 
 client.on('interactionCreate', async (i) => {
@@ -102,43 +89,49 @@ client.on('interactionCreate', async (i) => {
     // ---------- OYUNCU KOMUTLARI ----------
     if (i.commandName === 'kuyruga-gir') {
       const nick = i.options.getString('nick');
-      const kalan = await kalanCooldown(i.user.id, kit);
+      const kalan = kalanCooldown(i.user.id, kit);
       if (kalan) {
         return i.reply({ content: `⏳ ${kit} için cooldown'dasın. **${kalan} gün** sonra tekrar deneyebilirsin.`, ephemeral: true });
       }
-      const joined = Date.now();
-      try {
-        await queue.insertOne({ userId: i.user.id, kit, nick, joined });
-      } catch (e) {
-        if (e.code === 11000) return i.reply({ content: `Zaten ${kit} kuyruğundasın.`, ephemeral: true });
-        throw e;
+      if (queue.some((k) => k.userId === i.user.id && k.kit === kit)) {
+        return i.reply({ content: `Zaten ${kit} kuyruğundasın.`, ephemeral: true });
       }
-      const sira = await queue.countDocuments({ kit, joined: { $lte: joined } });
+      queue.push({ userId: i.user.id, kit, nick, joined: Date.now() });
+      const sira = queue.filter((k) => k.kit === kit).length;
       return i.reply({ content: `✅ **${kit}** kuyruğuna girdin. Sıran: **${sira}**`, ephemeral: true });
     }
 
     if (i.commandName === 'kuyruktan-cik') {
-      const r = await queue.deleteOne({ userId: i.user.id, kit });
-      return i.reply({ content: r.deletedCount ? 'Kuyruktan çıkarıldın.' : 'Bu kitte kuyrukta değilsin.', ephemeral: true });
+      const idx = queue.findIndex((k) => k.userId === i.user.id && k.kit === kit);
+      if (idx === -1) return i.reply({ content: 'Bu kitte kuyrukta değilsin.', ephemeral: true });
+      queue.splice(idx, 1);
+      return i.reply({ content: 'Kuyruktan çıkarıldın.', ephemeral: true });
     }
 
     if (i.commandName === 'kuyruk') {
-      const liste = await queue.find({ kit }).sort({ joined: 1 }).limit(15).toArray();
+      const liste = queue.filter((k) => k.kit === kit);
       if (!liste.length) return i.reply(`${kit} kuyruğu boş.`);
-      const toplam = await queue.countDocuments({ kit });
       const embed = new EmbedBuilder()
-        .setTitle(`${kit} Kuyruğu (${toplam} kişi)`)
-        .setDescription(liste.map((k, n) => `**${n + 1}.** <@${k.userId}> (\`${k.nick}\`)`).join('\n'))
+        .setTitle(`${kit} Kuyruğu (${liste.length} kişi)`)
+        .setDescription(liste.slice(0, 15).map((k, n) => `**${n + 1}.** <@${k.userId}> (\`${k.nick}\`)`).join('\n'))
         .setColor(0x5865f2);
       return i.reply({ embeds: [embed] });
     }
 
     if (i.commandName === 'profil') {
-      const kullanici = i.options.getUser('oyuncu') || i.user;
-      const liste = await tiers.find({ userId: kullanici.id }).toArray();
-      if (!liste.length) return i.reply({ content: `${kullanici.username} henüz test olmamış.`, ephemeral: true });
-      const embed = new EmbedBuilder().setTitle(`${liste[0].nick} - Tierler`).setColor(0xf1c40f);
-      liste.forEach((t) => embed.addFields({ name: t.kit, value: `**${t.tier}**`, inline: true }));
+      const uye = i.options.getMember('oyuncu') || i.member;
+      const tierRolleri = uye.roles.cache.filter((r) => {
+        const [k, t] = r.name.split(' ');
+        return KITLER.includes(k) && TIERLER.includes(t);
+      });
+      if (!tierRolleri.size) {
+        return i.reply({ content: `${uye.displayName} henüz test olmamış.`, ephemeral: true });
+      }
+      const embed = new EmbedBuilder().setTitle(`${uye.displayName} - Tierler`).setColor(0xf1c40f);
+      tierRolleri.forEach((r) => {
+        const [k, t] = r.name.split(' ');
+        embed.addFields({ name: k, value: `**${t}**`, inline: true });
+      });
       return i.reply({ embeds: [embed] });
     }
 
@@ -149,8 +142,9 @@ client.on('interactionCreate', async (i) => {
 
     if (i.commandName === 'test-baslat') {
       await i.deferReply({ ephemeral: true });
-      const siradaki = await queue.findOneAndDelete({ kit }, { sort: { joined: 1 } });
-      if (!siradaki) return i.editReply('Kuyruk boş.');
+      const idx = queue.findIndex((k) => k.kit === kit);
+      if (idx === -1) return i.editReply('Kuyruk boş.');
+      const siradaki = queue.splice(idx, 1)[0];
 
       const oyuncu = await i.guild.members.fetch(siradaki.userId).catch(() => null);
       if (!oyuncu) return i.editReply('Oyuncu sunucudan ayrılmış, kuyruktan silindi. Tekrar dene.');
@@ -178,18 +172,14 @@ client.on('interactionCreate', async (i) => {
       const tier = i.options.getString('tier');
       const nick = i.options.getString('nick');
 
-      await tiers.updateOne(
-        { userId: oyuncu.id, kit },
-        { $set: { tier, nick, testerId: i.user.id, testedAt: Date.now() } },
-        { upsert: true }
-      );
-
       // Eski tier rolünü kaldır, yenisini ver (rol yoksa oluşturur)
       const eski = oyuncu.roles.cache.filter((r) => new RegExp(`^${kit} (HT|LT)\\d$`).test(r.name));
       if (eski.size) await oyuncu.roles.remove(eski);
       const rolAdi = `${kit} ${tier}`;
       const rol = i.guild.roles.cache.find((r) => r.name === rolAdi) || (await i.guild.roles.create({ name: rolAdi }));
       await oyuncu.roles.add(rol);
+
+      cooldowns.set(`${oyuncu.id}:${kit}`, Date.now() + COOLDOWN_GUN * 86400000);
 
       const embed = new EmbedBuilder()
         .setTitle('Test Sonucu')
