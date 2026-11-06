@@ -459,16 +459,19 @@ const komutTanimlari = [
         )
     )
     .addSubcommand((s) =>
-      s
-        .setName('sonuc-kanal')
-        .setDescription('Sonuçların duyurulacağı kanal')
-        .addChannelOption((o) =>
-          o
-            .setName('kanal')
-            .setdescription?.('Kanal')
-            .setRequired(true)
-            .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+  s
+    .setName('sonuc-kanal')
+    .setDescription('Sonuçların duyurulacağı kanal')
+    .addChannelOption((o) =>
+      o
+        .setName('kanal')
+        .setDescription('Kanal')
+        .setRequired(true)
+        .addChannelTypes(
+          ChannelType.GuildText,
+          ChannelType.GuildAnnouncement
         )
+      )
     )
     .addSubcommand((s) =>
       s
