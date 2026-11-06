@@ -72,6 +72,14 @@ async function kalanCooldown(userId, kit) {
 }
 
 client.once('clientReady', async () => {
+  // --- MONGO KONTROL (şifreyi yazdırmaz, sadece uzunluğunu gösterir) ---
+  try {
+    const u = new URL(MONGO_URI);
+    console.log('MONGO kullanici:', u.username, '| sifre uzunlugu:', u.password.length, '| host:', u.hostname);
+  } catch (e) {
+    console.log('MONGO_URI okunamadi veya bos:', typeof MONGO_URI);
+  }
+
   const mongo = new MongoClient(MONGO_URI);
   await mongo.connect();
   const db = mongo.db('tiertest');
