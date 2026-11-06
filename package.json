@@ -1,15 +1,17 @@
 {
   "name": "tier-test-bot",
   "version": "1.0.0",
-  "description": "Tier Test Discord Bot",
+  "description": "Waitlist-based Minecraft PvP tier test bot for Discord",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
-  "dependencies": {
-    "discord.js": "^14.25.1"
-  },
   "engines": {
-    "node": ">=20.0.0"
-  }
+    "node": ">=18"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  },
+  "license": "MIT"
 }
