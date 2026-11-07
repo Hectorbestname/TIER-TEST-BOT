@@ -476,7 +476,10 @@ async function testAc(i, kit, hedef) {
         { name: 'Nick', value: `\`${giris.nick}\``, inline: true }
       )
       .setDescription('Test bitince tester `/tier-ver tier:<tier>` yazar (oyuncu, kit ve nick bu kanaldan otomatik alınır), ardından `/kapat` kullanır.');
-    await kanal.send({ content: `${uye} test sırası sende!`, embeds: [embed] });
+    const kapatSatiri = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('t_kapat').setLabel('Ticketi Kapat').setStyle(ButtonStyle.Danger)
+    );
+    await kanal.send({ content: `${uye} test sırası sende!`, embeds: [embed], components: [kapatSatiri] });
     await logla(i.guild, `🧪 ${i.user.tag} → ${uye.user.tag} için **${kit}** testi başlattı (#${kanal.name}).`);
 
     const sonraki = kuyrukListesi(kit)[0];
@@ -742,6 +745,16 @@ komutlar['tier-ver'] = async (i) => {
   const kapatNotu = bilet ? '\nİş bitince `/kapat` ile kanalı kapat.' : '';
   return i.editReply(`Tier verildi ✅ **${kit} ${tier}**\n${rolNotu}${duyuru}${kapatNotu}`);
 };
+
+async function ticketKapatButon(i) {
+  // Sadece botun açtığı (kayıtlı) test kanalları kapatılabilir
+  if (!state.tickets[i.channelId]) return i.reply({ content: '❌ Bu bir test kanalı değil.', flags: GIZLI });
+  await i.reply('🔒 Ticket kapatılıyor...');
+  delete state.tickets[i.channelId];
+  kaydet();
+  await logla(i.guild, `🔒 ${i.user.tag} test kanalını kapattı (#${i.channel.name}).`);
+  return i.channel.delete().catch((e) => console.log('Kanal silinemedi:', e.message));
+}
 
 komutlar.kapat = async (i) => {
   // Sadece botun açtığı (kayıtlı) test kanalları kapatılabilir
@@ -1048,6 +1061,10 @@ async function nickPenceresi(i) {
 const BUTON_TURLERI = new Set(['q_join', 'q_leave', 'q_toggle', 'q_next', 'q_clear']);
 
 async function butonIsle(i) {
+  if (i.customId === 't_kapat') {
+    if (!testerMi(i.member)) return i.reply({ content: '🔒 Ticketi sadece testerlar kapatabilir.', flags: GIZLI });
+    return ticketKapatButon(i);
+  }
   const [tur, kitAdi] = i.customId.split(':');
   if (!BUTON_TURLERI.has(tur)) return;
   const kit = kitBul(kitAdi);
