@@ -1,6 +1,7 @@
 
 require("dotenv").config();
 
+const http = require("http");
 const {
   Client,
   GatewayIntentBits,
@@ -8,7 +9,6 @@ const {
   Routes,
   SlashCommandBuilder,
   PermissionFlagsBits,
-  ChannelType,
   EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
@@ -16,6 +16,8 @@ const {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  StringSelectMenuBuilder,
+  MessageFlags,
   Colors,
 } = require("discord.js");
 
@@ -27,56 +29,51 @@ const Database = require("better-sqlite3");
 
 const CONFIG = {
   COLOR: 0xD71920,
+  WHITE: 0xFFFFFF,
 
-  // Bu kanallara kanal ID'lerini yaz.
-  // Boş bırakırsan tier sonucu komutun yazıldığı kanala gider.
+  // Tier sonuçlarının gönderileceği kanal
   TIER_RESULT_CHANNEL_ID: "",
+
+  // Tier işlemlerinin kaydedileceği log kanalı
   LOG_CHANNEL_ID: "",
 
-  // Kuyruk yönetebilecek rollerin ID'leri.
-  // Boş bırakılırsa yalnızca Yönetici yetkisi olanlar yönetebilir.
+  // Kuyruk ve tier yönetebilecek yetkili rol ID'leri
+  // Boş bırakılırsa Yönetici / Sunucuyu Yönet yetkisi gerekir.
   STAFF_ROLE_IDS: [],
 
   KITS: {
     netpot: {
       name: "NETPOT",
-      emoji: "🛡️",
       role: "NETPOT WAITLIST",
       queueCommand: "netpot-kuyruk",
     },
     sword: {
       name: "SWORD",
-      emoji: "⚔️",
       role: "SWORD WAITLIST",
       queueCommand: "sword-kuyruk",
     },
     smp: {
       name: "SMP",
-      emoji: "🌍",
       role: "SMP WAITLIST",
       queueCommand: "smp-kuyruk",
     },
     cpvp: {
       name: "CPVP",
-      emoji: "💎",
       role: "CPVP WAITLIST",
       queueCommand: "cpvp-kuyruk",
     },
     mace: {
       name: "MACE",
-      emoji: "🔨",
       role: "MACE WAITLIST",
       queueCommand: "mace-kuyruk",
     },
     axe: {
       name: "AXE",
-      emoji: "🪓",
       role: "AXE WAITLIST",
       queueCommand: "axe-kuyruk",
     },
     uhc: {
       name: "UHC",
-      emoji: "❤️",
       role: "UHC WAITLIST",
       queueCommand: "uhc-kuyruk",
     },
@@ -139,23 +136,6 @@ function getKit(kitId) {
   return CONFIG.KITS[kitId] || null;
 }
 
-function getKitEntries(kitId) {
-  return db.prepare(`
-    SELECT *
-    FROM queue_entries
-    WHERE kit = ?
-    ORDER BY id ASC
-  `).all(kitId);
-}
-
-function getQueue(kitId) {
-  return db.prepare(`
-    SELECT *
-    FROM queues
-    WHERE kit = ?
-  `).get(kitId);
-}
-
 function isStaff(member) {
   if (
     member.permissions.has(PermissionFlagsBits.Administrator) ||
@@ -181,17 +161,25 @@ function getTier(kitId, playerName) {
   `).get(kitId, playerName.toLowerCase());
 }
 
-function getQueueCount(kitId) {
+function getQueue(kitId) {
   return db.prepare(`
-    SELECT COUNT(*) AS count
+    SELECT *
+    FROM queues
+    WHERE kit = ?
+  `).get(kitId);
+}
+
+function getQueueEntries(kitId) {
+  return db.prepare(`
+    SELECT *
     FROM queue_entries
     WHERE kit = ?
-  `).get(kitId).count;
+    ORDER BY id ASC
+  `).all(kitId);
 }
 
 /* =====================================================
-   ROL OLUŞTURMA / BULMA
-   Kanal oluşturulmaz ve kanal izinlerine dokunulmaz.
+   WAITLIST ROLLERİ
 ===================================================== */
 
 async function getOrCreateWaitlistRole(guild, kit) {
@@ -202,11 +190,13 @@ async function getOrCreateWaitlistRole(guild, kit) {
   if (!role) {
     role = await guild.roles.create({
       name: kit.role,
-      color: CONFIG.COLOR,
+      color: CONFIG.WHITE,
       hoist: false,
       mentionable: false,
-      reason: "WAITLIST rolü",
+      reason: "HARLEM TIER LIST WAITLIST rolü",
     });
+
+    console.log("WAITLIST rolü oluşturuldu:", role.name);
   }
 
   return role;
@@ -217,55 +207,50 @@ async function getOrCreateWaitlistRole(guild, kit) {
 ===================================================== */
 
 function createWaitlistEmbed() {
-  const embed = new EmbedBuilder()
-    .setColor(CONFIG.COLOR)
+  const kitList = Object.values(CONFIG.KITS)
+    .map(kit => `⚪ **${kit.name}**`)
+    .join("\n");
+
+  return new EmbedBuilder()
+    .setColor(CONFIG.WHITE)
     .setTitle("WAITLIST")
     .setDescription(
-      "Almak istediğin kiti aşağıdan seç.\n" +
-      "Seçtiğin kitin WAITLIST rolü hesabına verilir.\n\n" +
-      "Aynı butona tekrar basarak rolünü kaldırabilirsin."
+      "WAITLIST almak istiyorsanız seçin."
     )
-    .setFooter({
-      text: "WAITLIST • Kit Selection",
+    .addFields({
+      name: "ALL KITS",
+      value: kitList,
+      inline: false,
     })
-    .setTimestamp();
-
-  for (const kit of Object.values(CONFIG.KITS)) {
-    embed.addFields({
-      name: `${kit.emoji} ${kit.name}`,
-      value: `\`${kit.role}\``,
-      inline: true,
+    .setFooter({
+      text: "HARLEM TIER LIST",
     });
-  }
-
-  return embed;
 }
 
-function createWaitlistButtons() {
-  const kits = Object.entries(CONFIG.KITS);
-  const rows = [];
+function createWaitlistMenu() {
+  const options = Object.entries(CONFIG.KITS).map(
+    ([kitId, kit]) => ({
+      label: kit.name,
+      value: kitId,
+      description: `${kit.name} WAITLIST rolünü al veya kaldır.`,
+      emoji: "⚪",
+    })
+  );
 
-  for (let i = 0; i < kits.length; i += 5) {
-    const row = new ActionRowBuilder();
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId("waitlist:select")
+    .setPlaceholder("Kit seçin...")
+    .setMinValues(1)
+    .setMaxValues(1)
+    .addOptions(options);
 
-    for (const [kitId, kit] of kits.slice(i, i + 5)) {
-      row.addComponents(
-        new ButtonBuilder()
-          .setCustomId(`waitlist:${kitId}`)
-          .setLabel(kit.name)
-          .setEmoji(kit.emoji)
-          .setStyle(ButtonStyle.Secondary)
-      );
-    }
-
-    rows.push(row);
-  }
-
-  return rows;
+  return [
+    new ActionRowBuilder().addComponents(menu),
+  ];
 }
 
 /* =====================================================
-   KUYRUK PANELİ EMBED
+   KUYRUK PANELİ
 ===================================================== */
 
 function createQueueEmbed(kitId, isOpen) {
@@ -278,18 +263,18 @@ function createQueueEmbed(kitId, isOpen) {
       ).join("\n")
     : "Henüz katılan oyuncu yok.";
 
-  const embed = new EmbedBuilder()
+  return new EmbedBuilder()
     .setColor(isOpen ? Colors.Green : Colors.Red)
-    .setTitle(`${kit.emoji} ${kit.name} KUYRUĞU`)
+    .setTitle(`${kit.name} KUYRUĞU`)
     .setDescription(
       isOpen
-        ? "Kuyruk şu anda açık. Katılmak için aşağıdaki butonu kullan."
+        ? "Kuyruk şu anda açık. Katılmak için aşağıdaki menüyü kullan."
         : "Kuyruk şu anda kapalı. Yeni oyuncu katılımı alınmıyor."
     )
     .addFields(
       {
         name: "Durum",
-        value: isOpen ? "🟢 AÇIK" : "🔴 KAPALI",
+        value: isOpen ? "AÇIK" : "KAPALI",
         inline: true,
       },
       {
@@ -304,26 +289,13 @@ function createQueueEmbed(kitId, isOpen) {
       }
     )
     .setFooter({
-      text: `${kit.name} • Independent Queue`,
+      text: `HARLEM TIER LIST • ${kit.name}`,
     })
     .setTimestamp();
-
-  return embed;
 }
-
-function getQueueEntries(kitId) {
-  return getQueueEntriesStatement.all(kitId);
-}
-
-const getQueueEntriesStatement = db.prepare(`
-  SELECT *
-  FROM queue_entries
-  WHERE kit = ?
-  ORDER BY id ASC
-`);
 
 /* =====================================================
-   KUYRUK PANELİ BUTONLARI
+   KUYRUK BUTONLARI
 ===================================================== */
 
 function createQueueButtons(kitId, isOpen) {
@@ -334,7 +306,6 @@ function createQueueButtons(kitId, isOpen) {
       new ButtonBuilder()
         .setCustomId(`queue:join:${kitId}`)
         .setLabel("Kuyruğa Katıl")
-        .setEmoji("➕")
         .setStyle(ButtonStyle.Success)
     );
   }
@@ -343,7 +314,6 @@ function createQueueButtons(kitId, isOpen) {
     new ButtonBuilder()
       .setCustomId(`queue:leave:${kitId}`)
       .setLabel("Kuyruktan Ayrıl")
-      .setEmoji("➖")
       .setStyle(ButtonStyle.Secondary)
   );
 
@@ -351,9 +321,8 @@ function createQueueButtons(kitId, isOpen) {
     new ButtonBuilder()
       .setCustomId(`queue:toggle:${kitId}`)
       .setLabel(isOpen ? "Kapat" : "Aç")
-      .setEmoji(isOpen ? "🔒" : "🔓")
       .setStyle(isOpen ? ButtonStyle.Danger : ButtonStyle.Success)
-    );
+  );
 
   return [row];
 }
@@ -367,13 +336,15 @@ async function updateQueuePanel(guild, kitId) {
 
   if (!queue) return;
 
-  const channel = await guild.channels.fetch(queue.channel_id)
-    .catch(() => null);
+  const channel = await guild.channels.fetch(
+    queue.channel_id
+  ).catch(() => null);
 
   if (!channel || !channel.isTextBased()) return;
 
-  const message = await channel.messages.fetch(queue.message_id)
-    .catch(() => null);
+  const message = await channel.messages.fetch(
+    queue.message_id
+  ).catch(() => null);
 
   if (!message) return;
 
@@ -389,24 +360,25 @@ async function updateQueuePanel(guild, kitId) {
 }
 
 /* =====================================================
-   KUYRUK AÇ / KAPAT KOMUTU
+   KUYRUK AÇ / KAPAT
 ===================================================== */
 
 async function toggleQueueCommand(interaction, kitId) {
   if (!isStaff(interaction.member)) {
     return interaction.reply({
       content: "Bu kuyruğu yönetme yetkin yok.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({
+    flags: MessageFlags.Ephemeral,
+  });
 
   const existing = getQueue(kitId);
+  const kit = getKit(kitId);
 
   if (!existing) {
-    const kit = getKit(kitId);
-
     const message = await interaction.channel.send({
       embeds: [createQueueEmbed(kitId, true)],
       components: createQueueButtons(kitId, true),
@@ -422,7 +394,7 @@ async function toggleQueueCommand(interaction, kitId) {
     );
 
     return interaction.editReply({
-      content: `${kit.emoji} **${kit.name}** kuyruğu açıldı ve panel gönderildi.`,
+      content: `${kit.name} kuyruğu açıldı ve panel gönderildi.`,
     });
   }
 
@@ -436,12 +408,10 @@ async function toggleQueueCommand(interaction, kitId) {
 
   await updateQueuePanel(interaction.guild, kitId);
 
-  const kit = getKit(kitId);
-
   return interaction.editReply({
     content: newStatus
-      ? `${kit.emoji} **${kit.name}** kuyruğu açıldı.`
-      : `${kit.emoji} **${kit.name}** kuyruğu kapatıldı.`,
+      ? `${kit.name} kuyruğu açıldı.`
+      : `${kit.name} kuyruğu kapatıldı.`,
   });
 }
 
@@ -483,7 +453,7 @@ async function addQueuePlayer(interaction, kitId, mcName) {
   if (!queue || !queue.is_open) {
     return interaction.reply({
       content: "Bu kuyruk şu anda kapalı.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -493,7 +463,7 @@ async function addQueuePlayer(interaction, kitId, mcName) {
   if (!/^[A-Za-z0-9_]{3,16}$/.test(cleanName)) {
     return interaction.reply({
       content: "Geçerli bir Minecraft kullanıcı adı gir.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -510,7 +480,7 @@ async function addQueuePlayer(interaction, kitId, mcName) {
   if (existing) {
     return interaction.reply({
       content: "Bu kuyrukta zaten kaydın bulunuyor.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
@@ -534,8 +504,10 @@ async function addQueuePlayer(interaction, kitId, mcName) {
   );
 
   await interaction.reply({
-    content: `${kit.emoji} **${kit.name}** kuyruğuna başarıyla katıldın.\nMinecraft adı: \`${cleanName}\``,
-    ephemeral: true,
+    content:
+      `${kit.name} kuyruğuna başarıyla katıldın.\n` +
+      `Minecraft adı: \`${cleanName}\``,
+    flags: MessageFlags.Ephemeral,
   });
 
   await updateQueuePanel(interaction.guild, kitId);
@@ -557,124 +529,135 @@ async function removeQueuePlayer(interaction, kitId) {
   if (!result.changes) {
     return interaction.reply({
       content: "Bu kitin kuyruğunda kaydın bulunmuyor.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
   const kit = getKit(kitId);
 
   await interaction.reply({
-    content: `${kit.emoji} **${kit.name}** kuyruğundan ayrıldın.`,
-    ephemeral: true,
+    content: `${kit.name} kuyruğundan ayrıldın.`,
+    flags: MessageFlags.Ephemeral,
   });
 
   await updateQueuePanel(interaction.guild, kitId);
 }
 
 /* =====================================================
-   TIER SONUÇ EMBED
+   TIER SONUÇ TASARIMI
 ===================================================== */
 
-function createTierResultEmbed({
-  kitId,
-  playerName,
-  oldTier,
-  newTier,
-  discordUser,
-  staffUser,
-}) {
-  const kit = getKit(kitId);
+function createTierResultEmbed(data) {
+  const kit = getKit(data.kitId);
 
-  return new EmbedBuilder()
+  const embed = new EmbedBuilder()
     .setColor(CONFIG.COLOR)
-    .setTitle("🏆 TIER TEST SONUCU")
+    .setAuthor({
+      name: "HARLEM TIER LIST • OFFICIAL RESULT",
+    })
+    .setTitle("TIER TEST RESULT")
     .setDescription(
-      `**${playerName}** oyuncusunun tier sonucu güncellendi.`
+      `**${data.playerName}** oyuncusunun tier testi sonucu açıklandı.`
     )
     .addFields(
       {
-        name: "Oyuncu",
-        value: `\`${playerName}\``,
+        name: "PLAYER",
+        value: `\`${data.playerName}\``,
         inline: true,
       },
       {
-        name: "Kit",
-        value: `${kit.emoji} **${kit.name}**`,
+        name: "KIT",
+        value: `**${kit.name}**`,
         inline: true,
       },
       {
-        name: "Eski Tier",
-        value: `\`${oldTier || "İlk kayıt"}\``,
-        inline: true,
-      },
-      {
-        name: "Yeni Tier",
-        value: `**${newTier}**`,
-        inline: true,
-      },
-      {
-        name: "Discord",
-        value: discordUser
-          ? `${discordUser} (\`${discordUser.tag}\`)`
-          : "Belirtilmedi",
+        name: "DISCORD",
+        value: `${data.discordUser}\n\`${data.discordUser.tag}\``,
         inline: false,
       },
       {
-        name: "Test Yetkilisi",
-        value: `${staffUser} (\`${staffUser.tag}\`)`,
+        name: "PREVIOUS TIER",
+        value: `\`${data.oldTier || "İlk kayıt"}\``,
+        inline: true,
+      },
+      {
+        name: "NEW TIER",
+        value: `**${data.newTier}**`,
+        inline: true,
+      },
+      {
+        name: "TESTER",
+        value: `${data.staffUser}`,
         inline: false,
       }
     )
     .setFooter({
-      text: "Tier Results • HARLEM PVP",
+      text: "HARLEM TIER LIST • OFFICIAL RANKING",
     })
     .setTimestamp();
+
+  const avatar = data.discordUser.displayAvatarURL({
+    extension: "png",
+    size: 256,
+  });
+
+  embed.setThumbnail(avatar);
+
+  return embed;
 }
 
 /* =====================================================
-   TIER LOG EMBED
+   TIER LOG TASARIMI
 ===================================================== */
 
 function createTierLogEmbed(data) {
   const kit = getKit(data.kitId);
 
   return new EmbedBuilder()
-    .setColor(Colors.DarkRed)
-    .setTitle("TIER DEĞİŞİKLİĞİ LOG")
+    .setColor(CONFIG.COLOR)
+    .setAuthor({
+      name: "HARLEM TIER LIST • SYSTEM LOG",
+    })
+    .setTitle("TIER CHANGE LOG")
     .addFields(
       {
-        name: "Minecraft Oyuncusu",
+        name: "Minecraft Player",
         value: `\`${data.playerName}\``,
         inline: true,
       },
       {
         name: "Kit",
-        value: `${kit.emoji} ${kit.name}`,
+        value: kit.name,
         inline: true,
       },
       {
-        name: "Eski Tier",
+        name: "Previous Tier",
         value: `\`${data.oldTier || "İlk kayıt"}\``,
         inline: true,
       },
       {
-        name: "Yeni Tier",
+        name: "New Tier",
         value: `\`${data.newTier}\``,
         inline: true,
       },
       {
-        name: "Oyuncunun Discord'u",
-        value: data.discordUser
-          ? `${data.discordUser.tag}\nID: \`${data.discordUser.id}\``
-          : "Belirtilmedi",
+        name: "Player Discord",
+        value:
+          `${data.discordUser.tag}\n` +
+          `ID: \`${data.discordUser.id}\``,
         inline: false,
       },
       {
-        name: "İşlemi Yapan",
-        value: `${data.staffUser.tag}\nID: \`${data.staffUser.id}\``,
+        name: "Staff",
+        value:
+          `${data.staffUser.tag}\n` +
+          `ID: \`${data.staffUser.id}\``,
         inline: false,
       }
     )
+    .setFooter({
+      text: "HARLEM TIER LIST • LOG SYSTEM",
+    })
     .setTimestamp();
 }
 
@@ -683,35 +666,59 @@ function createTierLogEmbed(data) {
 ===================================================== */
 
 async function giveTier(interaction) {
+  if (!isStaff(interaction.member)) {
+    return interaction.reply({
+      content: "Tier verme yetkin bulunmuyor.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
   const kitId = interaction.options.getString("kit");
   const playerName = interaction.options.getString("oyuncu").trim();
   const newTier = interaction.options.getString("yeni_tier").trim();
   const discordUser = interaction.options.getUser("discord");
 
-  if (!isStaff(interaction.member)) {
-    return interaction.reply({
-      content: "Tier verme yetkin bulunmuyor.",
-      ephemeral: true,
-    });
-  }
-
   if (!/^[A-Za-z0-9_]{3,16}$/.test(playerName)) {
     return interaction.reply({
       content: "Geçerli bir Minecraft oyuncu adı gir.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     });
   }
 
-  if (newTier.length > 32) {
+  if (!newTier || newTier.length > 32) {
     return interaction.reply({
-      content: "Tier adı en fazla 32 karakter olabilir.",
-      ephemeral: true,
+      content: "Geçerli bir tier adı gir.",
+      flags: MessageFlags.Ephemeral,
     });
   }
+
+  if (!discordUser) {
+    return interaction.reply({
+      content: "Oyuncunun Discord hesabını seçmelisin.",
+      flags: MessageFlags.Ephemeral,
+    });
+  }
+
+  await interaction.deferReply({
+    flags: MessageFlags.Ephemeral,
+  });
 
   const oldRecord = getTier(kitId, playerName);
   const oldTier = oldRecord?.tier || null;
 
+  const data = {
+    kitId,
+    playerName,
+    oldTier,
+    newTier,
+    discordUser,
+    staffUser: interaction.user,
+  };
+
+  const resultEmbed = createTierResultEmbed(data);
+  const logEmbed = createTierLogEmbed(data);
+
+  // Önce tier kaydını veritabanına kaydet.
   db.prepare(`
     INSERT INTO tiers (
       kit,
@@ -734,30 +741,27 @@ async function giveTier(interaction) {
     new Date().toISOString()
   );
 
-  const data = {
-    kitId,
-    playerName,
-    oldTier,
-    newTier,
-    discordUser,
-    staffUser: interaction.user,
-  };
-
-  const resultEmbed = createTierResultEmbed(data);
-  const logEmbed = createTierLogEmbed(data);
-
+  // Tier sonuç kanalını bul.
   const resultChannel = CONFIG.TIER_RESULT_CHANNEL_ID
     ? await interaction.guild.channels.fetch(
         CONFIG.TIER_RESULT_CHANNEL_ID
       ).catch(() => null)
     : interaction.channel;
 
-  if (resultChannel?.isTextBased()) {
-    await resultChannel.send({
-      embeds: [resultEmbed],
+  if (!resultChannel || !resultChannel.isTextBased()) {
+    return interaction.editReply({
+      content:
+        "Tier veritabanına kaydedildi ancak TIER RESULT kanalı bulunamadı. " +
+        "CONFIG içindeki TIER_RESULT_CHANNEL_ID değerini kontrol et.",
     });
   }
 
+  // Sonuç embedini gönder.
+  await resultChannel.send({
+    embeds: [resultEmbed],
+  });
+
+  // Log kanalına detayları gönder.
   if (CONFIG.LOG_CHANNEL_ID) {
     const logChannel = await interaction.guild.channels.fetch(
       CONFIG.LOG_CHANNEL_ID
@@ -770,11 +774,11 @@ async function giveTier(interaction) {
     }
   }
 
-  return interaction.reply({
+  return interaction.editReply({
     content:
-      `**${playerName}** oyuncusunun ${getKit(kitId).name} tier'ı güncellendi.\n` +
-      `Eski: \`${oldTier || "İlk kayıt"}\` → Yeni: \`${newTier}\``,
-    ephemeral: true,
+      `**${playerName}** oyuncusunun ${getKit(kitId).name} tierı güncellendi.\n` +
+      `Eski: \`${oldTier || "İlk kayıt"}\` → Yeni: \`${newTier}\`\n` +
+      `Sonuç TIER RESULT kanalına gönderildi.`,
   });
 }
 
@@ -788,20 +792,24 @@ function buildCommands() {
   commands.push(
     new SlashCommandBuilder()
       .setName("waitlist-kur")
-      .setDescription("7 kitin WAITLIST rollerini oluşturur.")
-      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+      .setDescription("WAITLIST rollerini oluşturur.")
+      .setDefaultMemberPermissions(
+        PermissionFlagsBits.Administrator
+      )
   );
 
   commands.push(
     new SlashCommandBuilder()
       .setName("waitlist-panel")
-      .setDescription("WAITLIST rol seçim panelini gönderir.")
-      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+      .setDescription("WAITLIST seçim panelini gönderir.")
+      .setDefaultMemberPermissions(
+        PermissionFlagsBits.Administrator
+      )
   );
 
   const tierCommand = new SlashCommandBuilder()
     .setName("tier")
-    .setDescription("Oyuncunun tier bilgisini yönetir.");
+    .setDescription("HARLEM TIER LIST tier yönetimi.");
 
   tierCommand.addSubcommand(sub =>
     sub
@@ -809,8 +817,20 @@ function buildCommands() {
       .setDescription("Oyuncuya yeni tier verir.")
       .addStringOption(option =>
         option
+          .setName("oyuncu")
+          .setDescription("Minecraft oyuncu adı")
+          .setRequired(true)
+      )
+      .addUserOption(option =>
+        option
+          .setName("discord")
+          .setDescription("Oyuncunun Discord hesabı")
+          .setRequired(true)
+      )
+      .addStringOption(option =>
+        option
           .setName("kit")
-          .setDescription("Kit seç")
+          .setDescription("Test edilen kit")
           .setRequired(true)
           .addChoices(
             ...Object.entries(CONFIG.KITS).map(([id, kit]) => ({
@@ -821,21 +841,9 @@ function buildCommands() {
       )
       .addStringOption(option =>
         option
-          .setName("oyuncu")
-          .setDescription("Minecraft oyuncu adı")
-          .setRequired(true)
-      )
-      .addStringOption(option =>
-        option
           .setName("yeni_tier")
           .setDescription("Verilecek yeni tier")
           .setRequired(true)
-      )
-      .addUserOption(option =>
-        option
-          .setName("discord")
-          .setDescription("Oyuncunun Discord hesabı")
-          .setRequired(false)
       )
   );
 
@@ -870,7 +878,7 @@ async function registerCommands() {
     }
   );
 
-  console.log("Slash komutları kaydedildi.");
+  console.log("Slash komutları başarıyla kaydedildi.");
 }
 
 /* =====================================================
@@ -895,17 +903,19 @@ client.once("ready", async () => {
 
 client.on("interactionCreate", async interaction => {
   try {
-    /* WAITLIST BUTONLARI */
+    /* WAITLIST SEÇİM MENÜSÜ */
 
-    if (interaction.isButton() &&
-        interaction.customId.startsWith("waitlist:")) {
-      const kitId = interaction.customId.split(":")[1];
+    if (
+      interaction.isStringSelectMenu() &&
+      interaction.customId === "waitlist:select"
+    ) {
+      const kitId = interaction.values[0];
       const kit = getKit(kitId);
 
       if (!kit) {
         return interaction.reply({
           content: "Kit bulunamadı.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
@@ -922,23 +932,25 @@ client.on("interactionCreate", async interaction => {
         await member.roles.remove(role);
 
         return interaction.reply({
-          content: `${kit.emoji} **${kit.name} WAITLIST** rolün kaldırıldı.`,
-          ephemeral: true,
+          content: `${kit.name} WAITLIST rolün kaldırıldı.`,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
       await member.roles.add(role);
 
       return interaction.reply({
-        content: `${kit.emoji} **${kit.name} WAITLIST** rolünü aldın.`,
-        ephemeral: true,
+        content: `${kit.name} WAITLIST rolünü aldın.`,
+        flags: MessageFlags.Ephemeral,
       });
     }
 
     /* KUYRUK BUTONLARI */
 
-    if (interaction.isButton() &&
-        interaction.customId.startsWith("queue:")) {
+    if (
+      interaction.isButton() &&
+      interaction.customId.startsWith("queue:")
+    ) {
       const parts = interaction.customId.split(":");
       const action = parts[1];
       const kitId = parts[2];
@@ -946,7 +958,7 @@ client.on("interactionCreate", async interaction => {
       if (!getKit(kitId)) {
         return interaction.reply({
           content: "Kit bulunamadı.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
@@ -956,11 +968,13 @@ client.on("interactionCreate", async interaction => {
         if (!queue || !queue.is_open) {
           return interaction.reply({
             content: "Bu kuyruk kapalı.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
 
-        return interaction.showModal(createJoinModal(kitId));
+        return interaction.showModal(
+          createJoinModal(kitId)
+        );
       }
 
       if (action === "leave") {
@@ -970,8 +984,8 @@ client.on("interactionCreate", async interaction => {
       if (action === "toggle") {
         if (!isStaff(interaction.member)) {
           return interaction.reply({
-            content: "Bu butonu kullanma yetkin yok.",
-            ephemeral: true,
+            content: "Bu işlemi yapma yetkin yok.",
+            flags: MessageFlags.Ephemeral,
           });
         }
 
@@ -980,7 +994,7 @@ client.on("interactionCreate", async interaction => {
         if (!queue) {
           return interaction.reply({
             content: "Kuyruk kaydı bulunamadı.",
-            ephemeral: true,
+            flags: MessageFlags.Ephemeral,
           });
         }
 
@@ -993,7 +1007,11 @@ client.on("interactionCreate", async interaction => {
         `).run(newStatus, kitId);
 
         await interaction.deferUpdate();
-        await updateQueuePanel(interaction.guild, kitId);
+
+        await updateQueuePanel(
+          interaction.guild,
+          kitId
+        );
 
         return;
       }
@@ -1001,14 +1019,21 @@ client.on("interactionCreate", async interaction => {
 
     /* KUYRUK MODALI */
 
-    if (interaction.isModalSubmit() &&
-        interaction.customId.startsWith("queue:modal:")) {
+    if (
+      interaction.isModalSubmit() &&
+      interaction.customId.startsWith("queue:modal:")
+    ) {
       const kitId = interaction.customId.split(":")[2];
+
       const mcName = interaction.fields.getTextInputValue(
         "minecraft_name"
       );
 
-      return addQueuePlayer(interaction, kitId, mcName);
+      return addQueuePlayer(
+        interaction,
+        kitId,
+        mcName
+      );
     }
 
     /* SLASH KOMUTLARI */
@@ -1016,7 +1041,9 @@ client.on("interactionCreate", async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
     if (interaction.commandName === "waitlist-kur") {
-      await interaction.deferReply({ ephemeral: true });
+      await interaction.deferReply({
+        flags: MessageFlags.Ephemeral,
+      });
 
       const created = [];
 
@@ -1026,14 +1053,14 @@ client.on("interactionCreate", async interaction => {
           kit
         );
 
-        created.push(`${kit.emoji} ${role.name}`);
+        created.push(role.name);
       }
 
       return interaction.editReply({
         content:
           "**WAITLIST rolleri hazır.**\n\n" +
-          created.map(item => `• ${item}`).join("\n") +
-          "\n\nHiçbir kanal oluşturulmadı veya kanal izni değiştirilmedi.",
+          created.map(name => `• ${name}`).join("\n") +
+          "\n\nKanal oluşturulmadı ve kanal izinleri değiştirilmedi.",
       });
     }
 
@@ -1043,16 +1070,14 @@ client.on("interactionCreate", async interaction => {
       )) {
         return interaction.reply({
           content: "Bu komutu kullanma yetkin yok.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
       }
 
-      await interaction.reply({
+      return interaction.reply({
         embeds: [createWaitlistEmbed()],
-        components: createWaitlistButtons(),
+        components: createWaitlistMenu(),
       });
-
-      return;
     }
 
     if (interaction.commandName === "tier") {
@@ -1062,10 +1087,15 @@ client.on("interactionCreate", async interaction => {
     }
 
     const queueKit = Object.entries(CONFIG.KITS)
-      .find(([, kit]) => kit.queueCommand === interaction.commandName);
+      .find(([, kit]) =>
+        kit.queueCommand === interaction.commandName
+      );
 
     if (queueKit) {
-      return toggleQueueCommand(interaction, queueKit[0]);
+      return toggleQueueCommand(
+        interaction,
+        queueKit[0]
+      );
     }
 
   } catch (error) {
@@ -1073,7 +1103,7 @@ client.on("interactionCreate", async interaction => {
 
     const errorMessage = {
       content: "Bir hata oluştu. Bot konsolunu kontrol et.",
-      ephemeral: true,
+      flags: MessageFlags.Ephemeral,
     };
 
     if (interaction.deferred || interaction.replied) {
@@ -1082,6 +1112,22 @@ client.on("interactionCreate", async interaction => {
       await interaction.reply(errorMessage).catch(() => {});
     }
   }
+});
+
+/* =====================================================
+   RENDER HTTP SERVER
+===================================================== */
+
+const PORT = process.env.PORT || 10000;
+
+http.createServer((req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/plain; charset=utf-8",
+  });
+
+  res.end("HARLEM TIER LIST BOT ACTIVE");
+}).listen(PORT, "0.0.0.0", () => {
+  console.log(`HTTP server çalışıyor: ${PORT}`);
 });
 
 /* =====================================================
