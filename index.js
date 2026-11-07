@@ -1,8 +1,18 @@
 // ==========================================================================
 //  TIER TEST BOT  -  discord.js v14
-//  Özellikler: kuyruk, bekleme listesi paneli, test kanalı, tier verme,
-//  cooldown, tester aktif/pasif, istatistik, yönetici ayar komutları.
-//  Bot HİÇBİR ZAMAN rol oluşturmaz. Hazır rolleri kullanır (istersen).
+//
+//  SİSTEM ÖZETİ
+//  1) WAITLIST paneli (tek panel, 7 kit butonu):
+//       Oyuncu kit butonuna basar -> o kitin HAZIR rolünü alır -> kanalı görür.
+//       Tekrar basarsa rol kaldırılır (ve o kuyruktan da çıkarılır).
+//  2) 7 AYRI KUYRUK: NETPOT, SWORD, SMP, CPVP, MACE, AXE, UHC
+//       Her kitin kendi kanalı ve kendi paneli vardır.
+//       KATIL butonu -> Minecraft adı -> sıraya girer.
+//  3) YÖNETİM: her kuyruk bağımsız açılıp kapatılır.
+//       Yönetim butonlarını sadece tester/yönetici kullanabilir.
+//  Özet: WAITLIST kanal erişimi verir, kuyruk test sırasını belirler.
+//
+//  Bot HİÇBİR ZAMAN rol oluşturmaz, sadece var olan rolleri verir/alır.
 // ==========================================================================
 const fs = require('fs');
 const path = require('path');
@@ -17,7 +27,6 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  StringSelectMenuBuilder,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -27,8 +36,9 @@ const {
 // --------------------------------------------------------------------------
 //  1) TEMEL AYARLAR
 //  Zorunlu: DISCORD_TOKEN ve GUILD_ID (Render > Environment).
-//  Diğerleri (TESTER_ROLE_ID, RESULT_CHANNEL_ID, TICKET_CATEGORY_ID,
-//  LOG_CHANNEL_ID) isteğe bağlı: sonradan /ayar komutlarıyla da girilebilir.
+//  İsteğe bağlı (sonradan /ayar ile de girilir):
+//    TESTER_ROLE_ID, RESULT_CHANNEL_ID, TICKET_CATEGORY_ID, LOG_CHANNEL_ID
+//    KIT_ROLE_NETPOT, KIT_CHANNEL_NETPOT ... (her kit için WAITLIST rolü/kanalı)
 // --------------------------------------------------------------------------
 const { DISCORD_TOKEN, GUILD_ID } = process.env;
 if (!DISCORD_TOKEN || !GUILD_ID) {
@@ -36,21 +46,29 @@ if (!DISCORD_TOKEN || !GUILD_ID) {
   process.exit(1);
 }
 
+const KITLER = ['NETPOT', 'SWORD', 'SMP', 'CPVP', 'MACE', 'AXE', 'UHC'];
 const TIERLER = ['HT1', 'LT1', 'HT2', 'LT2', 'HT3', 'LT3', 'HT4', 'LT4', 'HT5', 'LT5'];
-const VARSAYILAN_KITLER = ['Crystal', 'Sword', 'Axe', 'Pot', 'NethPot', 'SMP', 'UHC', 'Vanilla'];
 const RENK = { ana: 0x5865f2, basari: 0x2ecc71, uyari: 0xf1c40f, hata: 0xe74c3c, gri: 0x95a5a6 };
 const GUN = 86400000;
 const GIZLI = MessageFlags.Ephemeral;
 const NICK_REGEX = /^[A-Za-z0-9_]{3,16}$/;
-const KIT_REGEX = /^[A-Za-z0-9 _+-]{1,20}$/;
 const DATA_FILE = path.join(process.env.DATA_DIR || __dirname, 'data.json');
 
 // --------------------------------------------------------------------------
 //  2) VERİ KATMANI (data.json)
-//  Not: Render ücretsiz planda disk kalıcı değildir. Deploy/restart olunca
-//  data.json silinir. Ayarları ve kuyruğu kalıcı yapmak için Render'da
-//  "Disk" ekleyip DATA_DIR değişkenini disk yoluna ver (örn. /data).
+//  Not: Render ücretsiz planda disk kalıcı değildir; deploy/restart olunca
+//  data.json silinir. Bu yüzden rol/kanal ID'lerini Render Environment'a da
+//  yazabilirsin (KIT_ROLE_*, KIT_CHANNEL_*). Kalıcı disk için DATA_DIR ver.
 // --------------------------------------------------------------------------
+function envKitHaritasi(onek) {
+  const harita = {};
+  for (const kit of KITLER) {
+    const deger = process.env[`${onek}_${kit}`];
+    if (deger) harita[kit] = deger;
+  }
+  return harita;
+}
+
 function varsayilanDurum() {
   return {
     settings: {
@@ -60,17 +78,18 @@ function varsayilanDurum() {
       logChannelId: process.env.LOG_CHANNEL_ID || '',
       cooldownDays: 14,
       maxQueue: 50,
-      autoRole: false, // false: bot rol vermez, tester elle verir
-      kits: [...VARSAYILAN_KITLER],
-      roleMap: {}, // "Kit:Tier" -> rol ID (hazır roller için eşleme)
+      autoRole: false, // false: tier rolünü bot vermez, tester elle verir
+      kitRoles: envKitHaritasi('KIT_ROLE'), // kit -> WAITLIST rol ID
+      kitChannels: envKitHaritasi('KIT_CHANNEL'), // kit -> kuyruk kanal ID
+      roleMap: {}, // "Kit:Tier" -> tier rol ID (hazır roller için eşleme)
     },
+    kitOpen: {}, // kit -> false ise kuyruk kapalı (varsayılan açık)
     queue: [], // { userId, kit, nick, joined }
     cooldowns: {}, // "userId:kit" -> bitiş zamanı (ms)
     results: {}, // "userId:kit" -> { tier, nick, testerId, at }
-    activeTesters: {}, // testerId -> [kit, kit]
     tickets: {}, // kanalId -> { userId, testerId, kit, nick, at }
     stats: {}, // testerId -> { tests, last }
-    panel: null, // { channelId, messageId }
+    panels: { waitlist: null, kits: {} }, // mesaj konumları
   };
 }
 
@@ -81,14 +100,28 @@ function yukle() {
     if (!fs.existsSync(DATA_FILE)) return;
     const kayit = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
     const v = varsayilanDurum();
-    state = { ...v, ...kayit, settings: { ...v.settings, ...(kayit.settings || {}) } };
+    const ks = kayit.settings || {};
+    state = {
+      ...v,
+      ...kayit,
+      settings: {
+        ...v.settings,
+        ...ks,
+        kitRoles: { ...v.settings.kitRoles, ...(ks.kitRoles || {}) },
+        kitChannels: { ...v.settings.kitChannels, ...(ks.kitChannels || {}) },
+        roleMap: ks.roleMap || {},
+      },
+      panels: {
+        waitlist: (kayit.panels && kayit.panels.waitlist) || null,
+        kits: (kayit.panels && kayit.panels.kits) || {},
+      },
+    };
     // Kayıtlı ID boşsa ortam değişkenindeki değeri kullan
     for (const k of ['testerRoleId', 'resultChannelId', 'ticketCategoryId', 'logChannelId']) {
-      state.settings[k] = (kayit.settings && kayit.settings[k]) || v.settings[k];
+      state.settings[k] = ks[k] || v.settings[k];
     }
-    if (!Array.isArray(state.settings.kits) || !state.settings.kits.length) {
-      state.settings.kits = [...VARSAYILAN_KITLER];
-    }
+    // Artık var olmayan kitlere ait kuyruk kayıtlarını at
+    state.queue = state.queue.filter((k) => KITLER.includes(k.kit));
     console.log('data.json yüklendi.');
   } catch (e) {
     console.log('data.json okunamadı, sıfırdan başlanıyor:', e.message);
@@ -117,7 +150,7 @@ const zaman = (ms) => `<t:${Math.floor(ms / 1000)}:R>`;
 
 function kitBul(ad) {
   if (!ad) return null;
-  return S().kits.find((k) => k.toLowerCase() === String(ad).toLowerCase()) || null;
+  return KITLER.find((k) => k.toLowerCase() === String(ad).toLowerCase()) || null;
 }
 
 function yoneticiMi(member) {
@@ -132,6 +165,10 @@ function testerMi(member) {
   return Boolean(S().testerRoleId) && member.roles.cache.has(S().testerRoleId);
 }
 
+function kitAcikMi(kit) {
+  return state.kitOpen[kit] !== false;
+}
+
 function cooldownKalan(userId, kit) {
   const bitis = state.cooldowns[`${userId}:${kit}`];
   return bitis && bitis > Date.now() ? bitis : null;
@@ -144,12 +181,6 @@ function kuyrukListesi(kit) {
 function siraBul(userId, kit) {
   const idx = kuyrukListesi(kit).findIndex((k) => k.userId === userId);
   return idx === -1 ? 0 : idx + 1;
-}
-
-function aktifTesterler(kit) {
-  return Object.entries(state.activeTesters)
-    .filter(([, kitler]) => kitler.includes(kit))
-    .map(([id]) => id);
 }
 
 function acikTestVarMi(userId, kit) {
@@ -167,8 +198,8 @@ async function logla(guild, metin) {
 }
 
 // --------------------------------------------------------------------------
-//  4) ROL YARDIMCILARI  (bot ASLA rol oluşturmaz, sadece var olanı bulur)
-//  Rol bulma sırası: 1) /ayar rol-esle ile eşlenmiş rol  2) "Kit Tier" adlı rol
+//  4) TIER ROLÜ YARDIMCILARI  (bot ASLA rol oluşturmaz)
+//  Rol bulma sırası: 1) /ayar rol-esle ile eşlenmiş rol  2) "KIT TIER" adlı rol
 // --------------------------------------------------------------------------
 function tierRoluBul(guild, kit, tier) {
   const eslesen = S().roleMap[`${kit}:${tier}`];
@@ -182,7 +213,7 @@ function tierRoluBul(guild, kit, tier) {
 
 function rolTierleri(member) {
   const sonuc = {};
-  for (const kit of S().kits) {
+  for (const kit of KITLER) {
     for (const tier of TIERLER) {
       const rol = tierRoluBul(member.guild, kit, tier);
       if (rol && member.roles.cache.has(rol.id) && !sonuc[kit]) sonuc[kit] = tier;
@@ -192,7 +223,7 @@ function rolTierleri(member) {
 }
 
 async function rolVer(guild, uye, kit, tier) {
-  if (!S().autoRole) return 'ℹ️ Otomatik rol kapalı, rolü elle ver.';
+  if (!S().autoRole) return 'ℹ️ Otomatik tier rolü kapalı, rolü elle ver.';
   const yeni = tierRoluBul(guild, kit, tier);
   if (!yeni) {
     return `⚠️ **${kit} ${tier}** rolü bulunamadı (bot rol oluşturmaz). \`/ayar rol-esle\` ile eşle ya da elle ver.`;
@@ -212,26 +243,34 @@ async function rolVer(guild, uye, kit, tier) {
 // --------------------------------------------------------------------------
 //  5) KUYRUK MANTIĞI
 // --------------------------------------------------------------------------
-function kuyrugaEkle(userId, kitAdi, nick) {
-  const kit = kitBul(kitAdi);
-  if (!kit) return { ok: false, msg: '❌ Bu kit mevcut değil.' };
+// Katılmaya engel bir durum varsa mesajını döner, yoksa null
+function kuyrukHata(member, kit) {
+  if (!kitAcikMi(kit)) return `🔴 **${kit}** kuyruğu şu an kapalı.`;
+  const rolId = S().kitRoles[kit];
+  if (rolId && !member.roles.cache.has(rolId)) {
+    return `❌ Önce WAITLIST panelinden **${kit}** rolünü almalısın.`;
+  }
+  const cd = cooldownKalan(member.id, kit);
+  if (cd) return `⏳ **${kit}** için cooldown'dasın. Tekrar test: ${zaman(cd)}`;
+  const sira = siraBul(member.id, kit);
+  if (sira) return `Zaten **${kit}** kuyruğundasın (sıra: **${sira}**).`;
+  if (acikTestVarMi(member.id, kit)) return `**${kit}** için zaten açık bir test kanalın var.`;
+  if (kuyrukListesi(kit).length >= S().maxQueue) {
+    return `❌ **${kit}** kuyruğu dolu (${S().maxQueue} kişi). Daha sonra tekrar dene.`;
+  }
+  return null;
+}
+
+function kuyrugaEkle(member, kit, nick) {
+  const hata = kuyrukHata(member, kit);
+  if (hata) return { ok: false, msg: hata };
   if (!NICK_REGEX.test(nick)) {
     return { ok: false, msg: '❌ Geçersiz Minecraft nicki (3-16 karakter, sadece harf, rakam ve _).' };
   }
-  const cd = cooldownKalan(userId, kit);
-  if (cd) return { ok: false, msg: `⏳ **${kit}** için cooldown'dasın. Tekrar test: ${zaman(cd)}` };
-  const sira = siraBul(userId, kit);
-  if (sira) return { ok: false, msg: `Zaten **${kit}** kuyruğundasın (sıra: **${sira}**).` };
-  if (acikTestVarMi(userId, kit)) {
-    return { ok: false, msg: `**${kit}** için zaten açık bir test kanalın var.` };
-  }
-  if (kuyrukListesi(kit).length >= S().maxQueue) {
-    return { ok: false, msg: `❌ **${kit}** kuyruğu dolu (${S().maxQueue} kişi). Daha sonra tekrar dene.` };
-  }
-  state.queue.push({ userId, kit, nick, joined: Date.now() });
+  state.queue.push({ userId: member.id, kit, nick, joined: Date.now() });
   kaydet();
-  panelGuncelle();
-  return { ok: true, msg: `✅ **${kit}** kuyruğuna girdin. Sıran: **${siraBul(userId, kit)}**` };
+  panelGuncelle(kit);
+  return { ok: true, msg: `✅ **${kit}** kuyruğuna girdin. Sıran: **${siraBul(member.id, kit)}**` };
 }
 
 function kuyruktanCikar(userId, kit) {
@@ -239,75 +278,238 @@ function kuyruktanCikar(userId, kit) {
   if (idx === -1) return false;
   state.queue.splice(idx, 1);
   kaydet();
-  panelGuncelle();
+  panelGuncelle(kit);
   return true;
 }
 
 // --------------------------------------------------------------------------
-//  6) BEKLEME LİSTESİ PANELİ (waitlist)
-//  Kanalda duran, otomatik güncellenen mesaj: kit menüsü + butonlar.
+//  6) PANELLER
+//  a) WAITLIST paneli: tek mesaj, 7 kit butonu (rol al / bırak)
+//  b) Kit paneli: her kitin kendi kanalında (KATIL, AYRIL + yönetim)
 // --------------------------------------------------------------------------
-function panelEmbed() {
+function waitlistEmbed() {
   const embed = new EmbedBuilder()
-    .setTitle('📋 Tier Test Bekleme Listesi')
+    .setTitle('📋 WAITLIST')
     .setColor(RENK.ana)
     .setDescription(
-      'Test olmak için aşağıdaki menüden **kit seç**, açılan pencereye **Minecraft nickini** yaz.\n' +
-        'Sıran gelince bir tester seninle özel kanal açacak.'
+      'Katılmak istediğin kitin butonuna bas: **o kitin rolünü alırsın ve kuyruk kanalını görürsün.**\n' +
+        'Butona tekrar basarsan rol kaldırılır.\n\n' +
+        'Sıraya girmek için kitin kanalındaki panelden **KATIL** butonunu kullan.'
     )
     .setFooter({ text: 'Son güncelleme' })
     .setTimestamp();
-  for (const kit of S().kits) {
-    const testerler = aktifTesterler(kit)
-      .slice(0, 5)
-      .map((id) => `<@${id}>`);
+  for (const kit of KITLER) {
+    const kanalId = S().kitChannels[kit];
     embed.addFields({
       name: kit,
-      value: `👥 Kuyruk: **${kuyrukListesi(kit).length}**\n🧑‍⚖️ ${testerler.length ? testerler.join(', ') : 'Aktif tester yok'}`,
+      value:
+        `${kanalId ? `<#${kanalId}>` : 'Kanal ayarlı değil'}\n` +
+        `${kitAcikMi(kit) ? '🟢 Açık' : '🔴 Kapalı'} • 👥 ${kuyrukListesi(kit).length}`,
       inline: true,
     });
   }
   return embed;
 }
 
-function panelBilesenleri() {
-  const menu = new StringSelectMenuBuilder()
-    .setCustomId('wl_join')
-    .setPlaceholder('Kuyruğa girmek için kit seç')
-    .addOptions(
-      S().kits.map((k) => ({
-        label: k,
-        value: k,
-        description: `${kuyrukListesi(k).length} kişi bekliyor`,
-      }))
-    );
-  const butonlar = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId('wl_leave').setLabel('Kuyruktan Çık').setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId('wl_pos').setLabel('Sıram').setStyle(ButtonStyle.Secondary)
+function waitlistBilesenleri() {
+  const butonlar = KITLER.map((kit) =>
+    new ButtonBuilder().setCustomId(`wl_rol:${kit}`).setLabel(kit).setStyle(ButtonStyle.Primary)
   );
-  return [new ActionRowBuilder().addComponents(menu), butonlar];
+  const satirlar = [];
+  for (let n = 0; n < butonlar.length; n += 5) {
+    satirlar.push(new ActionRowBuilder().addComponents(butonlar.slice(n, n + 5)));
+  }
+  return satirlar;
 }
 
+function kitPanelEmbed(kit) {
+  const acik = kitAcikMi(kit);
+  const liste = kuyrukListesi(kit);
+  let siraMetni = 'Kuyruk boş.';
+  if (liste.length) {
+    siraMetni = liste
+      .slice(0, 15)
+      .map((k, n) => `**${n + 1}.** <@${k.userId}> • \`${k.nick}\``)
+      .join('\n');
+    if (liste.length > 15) siraMetni += `\n... ve ${liste.length - 15} kişi daha`;
+  }
+  return new EmbedBuilder()
+    .setTitle(`⚔️ ${kit} Kuyruğu`)
+    .setColor(acik ? RENK.basari : RENK.hata)
+    .setDescription(
+      acik
+        ? 'Kuyruk **açık**. **KATIL** butonuna basıp Minecraft adını gir.'
+        : '🔴 Kuyruk şu an **kapalı**. Yeni katılım alınmıyor.'
+    )
+    .addFields(
+      { name: 'Durum', value: acik ? '🟢 Açık' : '🔴 Kapalı', inline: true },
+      { name: 'Bekleyen', value: String(liste.length), inline: true },
+      { name: 'Sıra', value: siraMetni }
+    )
+    .setFooter({ text: 'Son güncelleme' })
+    .setTimestamp();
+}
+
+function kitPanelBilesenleri(kit) {
+  const acik = kitAcikMi(kit);
+  const oyuncu = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`q_join:${kit}`)
+      .setLabel('KATIL')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(!acik),
+    new ButtonBuilder().setCustomId(`q_leave:${kit}`).setLabel('AYRIL').setStyle(ButtonStyle.Danger)
+  );
+  const yonetim = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`q_toggle:${kit}`)
+      .setLabel(acik ? 'Kuyruğu Kapat' : 'Kuyruğu Aç')
+      .setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`q_next:${kit}`).setLabel('Sıradakini Al').setStyle(ButtonStyle.Primary),
+    new ButtonBuilder().setCustomId(`q_clear:${kit}`).setLabel('Temizle').setStyle(ButtonStyle.Secondary)
+  );
+  return [oyuncu, yonetim];
+}
+
+// Panel güncellemeleri biriktirilir ve 2 saniyede bir toplu yapılır (rate limit)
+const kirliKitler = new Set();
 let panelZamanlayici = null;
-function panelGuncelle() {
+
+async function mesajDuzenle(konum, icerik) {
+  const kanal = await client.channels.fetch(konum.channelId);
+  const mesaj = await kanal.messages.fetch(konum.messageId);
+  await mesaj.edit(icerik);
+}
+
+function panelGuncelle(kit) {
+  if (kit) kirliKitler.add(kit);
+  else KITLER.forEach((k) => kirliKitler.add(k));
   clearTimeout(panelZamanlayici);
   panelZamanlayici = setTimeout(async () => {
-    if (!state.panel) return;
-    try {
-      const kanal = await client.channels.fetch(state.panel.channelId);
-      const mesaj = await kanal.messages.fetch(state.panel.messageId);
-      await mesaj.edit({ embeds: [panelEmbed()], components: panelBilesenleri() });
-    } catch (e) {
-      console.log('Panel güncellenemedi:', e.message);
+    const kitler = [...kirliKitler];
+    kirliKitler.clear();
+    for (const k of kitler) {
+      const konum = state.panels.kits[k];
+      if (!konum) continue;
+      try {
+        await mesajDuzenle(konum, { embeds: [kitPanelEmbed(k)], components: kitPanelBilesenleri(k) });
+      } catch (e) {
+        console.log(`${k} paneli güncellenemedi:`, e.message);
+      }
+    }
+    if (state.panels.waitlist) {
+      try {
+        await mesajDuzenle(state.panels.waitlist, {
+          embeds: [waitlistEmbed()],
+          components: waitlistBilesenleri(),
+        });
+      } catch (e) {
+        console.log('WAITLIST paneli güncellenemedi:', e.message);
+      }
     }
   }, 2000);
 }
 
+async function eskiMesajiSil(konum) {
+  if (!konum) return;
+  try {
+    const kanal = await client.channels.fetch(konum.channelId);
+    const mesaj = await kanal.messages.fetch(konum.messageId);
+    await mesaj.delete();
+  } catch (e) {
+    /* eski mesaj zaten yok */
+  }
+}
+
 // --------------------------------------------------------------------------
-//  7) KOMUT TANIMLARI
+//  7) TEST KANALI AÇMA (slash komutu ve "Sıradakini Al" butonu ortak kullanır)
+//  i: zaten deferReply yapılmış etkileşim, hedef: istenirse belirli oyuncu
+// --------------------------------------------------------------------------
+async function testAc(i, kit, hedef) {
+  let idx;
+  let giris;
+  if (hedef) {
+    idx = state.queue.findIndex((k) => k.userId === hedef.id && k.kit === kit);
+    giris = idx !== -1 ? state.queue[idx] : { userId: hedef.id, kit, nick: hedef.username };
+  } else {
+    idx = state.queue.findIndex((k) => k.kit === kit);
+    if (idx === -1) return i.editReply(`**${kit}** kuyruğu boş.`);
+    giris = state.queue[idx];
+  }
+  if (acikTestVarMi(giris.userId, kit)) {
+    return i.editReply('Bu oyuncunun bu kitte zaten açık bir test kanalı var.');
+  }
+
+  const uye = await i.guild.members.fetch(giris.userId).catch(() => null);
+  if (!uye) {
+    if (idx !== -1) state.queue.splice(idx, 1);
+    kaydet();
+    panelGuncelle(kit);
+    return i.editReply('Oyuncu sunucudan ayrılmış, kuyruktan silindi. Tekrar dene.');
+  }
+
+  const gorunum = [
+    PermissionFlagsBits.ViewChannel,
+    PermissionFlagsBits.SendMessages,
+    PermissionFlagsBits.ReadMessageHistory,
+  ];
+  const izinler = [
+    { id: i.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: uye.id, allow: gorunum },
+    { id: i.user.id, allow: gorunum },
+    {
+      id: client.user.id,
+      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels],
+    },
+  ];
+  if (S().testerRoleId && i.guild.roles.cache.has(S().testerRoleId)) {
+    izinler.push({ id: S().testerRoleId, allow: gorunum });
+  }
+
+  const kanalAdi = `test-${giris.nick}-${kit}`
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, '-')
+    .slice(0, 90);
+  const kanal = await i.guild.channels.create({
+    name: kanalAdi,
+    type: ChannelType.GuildText,
+    parent: S().ticketCategoryId || null,
+    permissionOverwrites: izinler,
+  });
+
+  // Kanal başarıyla açıldı: şimdi kuyruktan düş ve kaydı tut
+  if (idx !== -1) state.queue.splice(idx, 1);
+  state.tickets[kanal.id] = { userId: uye.id, testerId: i.user.id, kit, nick: giris.nick, at: Date.now() };
+  kaydet();
+  panelGuncelle(kit);
+
+  const embed = new EmbedBuilder()
+    .setTitle(`🧪 ${kit} Testi`)
+    .setColor(RENK.ana)
+    .addFields(
+      { name: 'Oyuncu', value: `${uye}`, inline: true },
+      { name: 'Tester', value: `${i.user}`, inline: true },
+      { name: 'Nick', value: `\`${giris.nick}\``, inline: true }
+    )
+    .setDescription('Test bitince tester `/tier-ver` ve ardından `/kapat` kullanacak.');
+  await kanal.send({ content: `${uye} test sırası sende!`, embeds: [embed] });
+  await logla(i.guild, `🧪 ${i.user.tag} → ${uye.user.tag} için **${kit}** testi başlattı (#${kanal.name}).`);
+
+  const sonraki = kuyrukListesi(kit)[0];
+  return i.editReply(
+    `Kanal açıldı: ${kanal}${sonraki ? `\nSıradaki oyuncu: <@${sonraki.userId}> (\`${sonraki.nick}\`)` : '\nKuyrukta başka kimse yok.'}`
+  );
+}
+
+// --------------------------------------------------------------------------
+//  8) KOMUT TANIMLARI
 // --------------------------------------------------------------------------
 const kitOpt = (o, zorunlu = true) =>
-  o.setName('kit').setDescription('Kit seç').setRequired(zorunlu).setAutocomplete(true);
+  o
+    .setName('kit')
+    .setDescription('Kit seç')
+    .setRequired(zorunlu)
+    .addChoices(...KITLER.map((k) => ({ name: k, value: k })));
 const tierOpt = (o) =>
   o
     .setName('tier')
@@ -315,14 +517,10 @@ const tierOpt = (o) =>
     .setRequired(true)
     .addChoices(...TIERLER.map((t) => ({ name: t, value: t })));
 const YONETIM = PermissionFlagsBits.ManageGuild;
+const kanalTipleri = [ChannelType.GuildText, ChannelType.GuildAnnouncement];
 
 const komutTanimlari = [
   // ---- Oyuncu komutları ----
-  new SlashCommandBuilder()
-    .setName('kuyruga-gir')
-    .setDescription('Test kuyruğuna katıl')
-    .addStringOption((o) => kitOpt(o))
-    .addStringOption((o) => o.setName('nick').setDescription('Minecraft nickin').setRequired(true)),
   new SlashCommandBuilder()
     .setName('kuyruktan-cik')
     .setDescription('Kuyruktan ayrıl')
@@ -353,18 +551,10 @@ const komutTanimlari = [
     .addStringOption((o) => o.setName('nick').setDescription('Minecraft nicki').setRequired(true)),
   new SlashCommandBuilder().setName('kapat').setDescription('[Tester] Test kanalını kapat'),
   new SlashCommandBuilder()
-    .setName('tester')
-    .setDescription('[Tester] Aktif/pasif durumu')
-    .addSubcommand((s) =>
-      s.setName('aktif').setDescription('Bir kitte test almaya hazırım').addStringOption((o) => kitOpt(o))
-    )
-    .addSubcommand((s) =>
-      s
-        .setName('pasif')
-        .setDescription('Aktifliği kapat (kit yazmazsan hepsi)')
-        .addStringOption((o) => kitOpt(o, false))
-    )
-    .addSubcommand((s) => s.setName('liste').setDescription('Aktif testerları göster')),
+    .setName('kuyruk-durum')
+    .setDescription('[Tester] Bir kuyruğu aç veya kapat')
+    .addStringOption((o) => kitOpt(o))
+    .addBooleanOption((o) => o.setName('acik').setDescription('Açık mı?').setRequired(true)),
   new SlashCommandBuilder()
     .setName('kuyruk-at')
     .setDescription('[Tester] Bir oyuncuyu kuyruktan çıkar')
@@ -378,15 +568,17 @@ const komutTanimlari = [
 
   // ---- Yönetici komutları ----
   new SlashCommandBuilder()
-    .setName('panel-kur')
-    .setDescription('[Yönetici] Bekleme listesi panelini gönder')
+    .setName('waitlist-kur')
+    .setDescription('[Yönetici] WAITLIST panelini gönder')
     .setDefaultMemberPermissions(YONETIM)
     .addChannelOption((o) =>
-      o
-        .setName('kanal')
-        .setDescription('Panelin gönderileceği kanal (boşsa bu kanal)')
-        .addChannelTypes(ChannelType.GuildText)
+      o.setName('kanal').setDescription('Panelin kanalı (boşsa bu kanal)').addChannelTypes(...kanalTipleri)
     ),
+  new SlashCommandBuilder()
+    .setName('kuyruk-panel-kur')
+    .setDescription('[Yönetici] Kuyruk panellerini kitlerin kanallarına gönder')
+    .setDefaultMemberPermissions(YONETIM)
+    .addStringOption((o) => kitOpt(o, false)),
   new SlashCommandBuilder()
     .setName('kuyruk-temizle')
     .setDescription('[Yönetici] Bir kitin kuyruğunu tamamen boşalt')
@@ -408,11 +600,7 @@ const komutTanimlari = [
         .setName('sonuc-kanal')
         .setDescription('Sonuçların duyurulacağı kanal')
         .addChannelOption((o) =>
-          o
-            .setName('kanal')
-            .setDescription('Kanal')
-            .setRequired(true)
-            .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+          o.setName('kanal').setDescription('Kanal').setRequired(true).addChannelTypes(...kanalTipleri)
         )
     )
     .addSubcommand((s) =>
@@ -420,11 +608,7 @@ const komutTanimlari = [
         .setName('log-kanal')
         .setDescription('Bot kayıtlarının yazılacağı kanal')
         .addChannelOption((o) =>
-          o
-            .setName('kanal')
-            .setDescription('Kanal')
-            .setRequired(true)
-            .addChannelTypes(ChannelType.GuildText, ChannelType.GuildAnnouncement)
+          o.setName('kanal').setDescription('Kanal').setRequired(true).addChannelTypes(...kanalTipleri)
         )
     )
     .addSubcommand((s) =>
@@ -437,6 +621,22 @@ const komutTanimlari = [
             .setDescription('Kategori')
             .setRequired(true)
             .addChannelTypes(ChannelType.GuildCategory)
+        )
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('kit-rol')
+        .setDescription('Bir kitin WAITLIST rolünü belirle (hazır rol)')
+        .addStringOption((o) => kitOpt(o))
+        .addRoleOption((o) => o.setName('rol').setDescription('Hazır rol').setRequired(true))
+    )
+    .addSubcommand((s) =>
+      s
+        .setName('kit-kanal')
+        .setDescription('Bir kitin kuyruk kanalını belirle')
+        .addStringOption((o) => kitOpt(o))
+        .addChannelOption((o) =>
+          o.setName('kanal').setDescription('Kuyruk kanalı').setRequired(true).addChannelTypes(...kanalTipleri)
         )
     )
     .addSubcommand((s) =>
@@ -458,24 +658,13 @@ const komutTanimlari = [
     .addSubcommand((s) =>
       s
         .setName('otomatik-rol')
-        .setDescription('Tier verilince bot hazır rolü versin mi')
+        .setDescription('Tier verilince bot hazır tier rolünü versin mi')
         .addBooleanOption((o) => o.setName('durum').setDescription('Açık / Kapalı').setRequired(true))
     )
     .addSubcommand((s) =>
       s
-        .setName('kit-ekle')
-        .setDescription('Yeni kit ekle')
-        .addStringOption((o) =>
-          o.setName('isim').setDescription('Kit adı (en fazla 20 karakter)').setRequired(true).setMaxLength(20)
-        )
-    )
-    .addSubcommand((s) =>
-      s.setName('kit-sil').setDescription('Bir kiti sil').addStringOption((o) => kitOpt(o))
-    )
-    .addSubcommand((s) =>
-      s
         .setName('rol-esle')
-        .setDescription('Kit + tier için hazır bir rolü eşle')
+        .setDescription('Kit + tier için hazır bir tier rolünü eşle')
         .addStringOption((o) => kitOpt(o))
         .addStringOption((o) => tierOpt(o))
         .addRoleOption((o) => o.setName('rol').setDescription('Hazır rol').setRequired(true))
@@ -483,7 +672,7 @@ const komutTanimlari = [
     .addSubcommand((s) =>
       s
         .setName('rol-esle-sil')
-        .setDescription('Rol eşlemesini kaldır')
+        .setDescription('Tier rol eşlemesini kaldır')
         .addStringOption((o) => kitOpt(o))
         .addStringOption((o) => tierOpt(o))
     )
@@ -492,20 +681,15 @@ const komutTanimlari = [
     ),
 ].map((c) => c.toJSON());
 
-const TESTER_KOMUTLARI = new Set(['test-baslat', 'tier-ver', 'kapat', 'tester', 'kuyruk-at', 'cooldown-sifirla']);
-const YONETICI_KOMUTLARI = new Set(['panel-kur', 'kuyruk-temizle', 'ayar']);
+const TESTER_KOMUTLARI = new Set(['test-baslat', 'tier-ver', 'kapat', 'kuyruk-durum', 'kuyruk-at', 'cooldown-sifirla']);
+const YONETICI_KOMUTLARI = new Set(['waitlist-kur', 'kuyruk-panel-kur', 'kuyruk-temizle', 'ayar']);
 
 // --------------------------------------------------------------------------
-//  8) KOMUT İŞLEYİCİLERİ
+//  9) KOMUT İŞLEYİCİLERİ
 // --------------------------------------------------------------------------
 const komutlar = {};
 
 // ---------- Oyuncu komutları ----------
-komutlar['kuyruga-gir'] = async (i) => {
-  const sonuc = kuyrugaEkle(i.user.id, i.options.getString('kit'), i.options.getString('nick').trim());
-  return i.reply({ content: sonuc.msg, flags: GIZLI });
-};
-
 komutlar['kuyruktan-cik'] = async (i) => {
   const kit = kitBul(i.options.getString('kit'));
   if (!kit) return i.reply({ content: '❌ Bu kit mevcut değil.', flags: GIZLI });
@@ -519,31 +703,12 @@ komutlar['kuyruktan-cik'] = async (i) => {
 komutlar.kuyruk = async (i) => {
   const kit = kitBul(i.options.getString('kit'));
   if (!kit) return i.reply({ content: '❌ Bu kit mevcut değil.', flags: GIZLI });
-  const liste = kuyrukListesi(kit);
-  const testerler = aktifTesterler(kit);
-  let aciklama = 'Kuyruk boş.';
-  if (liste.length) {
-    aciklama = liste
-      .slice(0, 20)
-      .map((k, n) => `**${n + 1}.** <@${k.userId}> • \`${k.nick}\` • ${zaman(k.joined)}`)
-      .join('\n');
-    if (liste.length > 20) aciklama += `\n... ve ${liste.length - 20} kişi daha`;
-  }
-  const embed = new EmbedBuilder()
-    .setTitle(`${kit} Kuyruğu`)
-    .setColor(RENK.ana)
-    .setDescription(aciklama)
-    .addFields({
-      name: 'Aktif testerlar',
-      value: testerler.length ? testerler.map((id) => `<@${id}>`).join(', ') : 'Şu an aktif tester yok',
-    })
-    .setFooter({ text: `Toplam: ${liste.length} kişi` });
+  const embed = kitPanelEmbed(kit);
   return i.reply({ embeds: [embed], allowedMentions: { parse: [] } });
 };
 
 komutlar.siram = async (i) => {
-  const satirlar = S()
-    .kits.map((kit) => ({ kit, sira: siraBul(i.user.id, kit) }))
+  const satirlar = KITLER.map((kit) => ({ kit, sira: siraBul(i.user.id, kit) }))
     .filter((x) => x.sira)
     .map((x) => `• **${x.kit}**: ${x.sira}. sıra (toplam ${kuyrukListesi(x.kit).length})`);
   return i.reply({
@@ -557,7 +722,7 @@ komutlar.profil = async (i) => {
   const tierler = {};
   let nick = null;
   // 1) Bot üzerinden verilen kayıtlar
-  for (const kit of S().kits) {
+  for (const kit of KITLER) {
     const kayit = state.results[`${uye.id}:${kit}`];
     if (kayit) {
       tierler[kit] = kayit.tier;
@@ -611,85 +776,7 @@ komutlar['test-baslat'] = async (i) => {
   await i.deferReply({ flags: GIZLI });
   const kit = kitBul(i.options.getString('kit'));
   if (!kit) return i.editReply('❌ Bu kit mevcut değil.');
-
-  const hedef = i.options.getUser('oyuncu');
-  let idx;
-  let giris;
-  if (hedef) {
-    idx = state.queue.findIndex((k) => k.userId === hedef.id && k.kit === kit);
-    giris = idx !== -1 ? state.queue[idx] : { userId: hedef.id, kit, nick: hedef.username };
-  } else {
-    idx = state.queue.findIndex((k) => k.kit === kit);
-    if (idx === -1) return i.editReply(`**${kit}** kuyruğu boş.`);
-    giris = state.queue[idx];
-  }
-  if (acikTestVarMi(giris.userId, kit)) {
-    return i.editReply('Bu oyuncunun bu kitte zaten açık bir test kanalı var.');
-  }
-
-  const uye = await i.guild.members.fetch(giris.userId).catch(() => null);
-  if (!uye) {
-    if (idx !== -1) state.queue.splice(idx, 1);
-    kaydet();
-    panelGuncelle();
-    return i.editReply('Oyuncu sunucudan ayrılmış, kuyruktan silindi. Tekrar dene.');
-  }
-
-  const izinler = [
-    { id: i.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-    {
-      id: uye.id,
-      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
-    },
-    {
-      id: i.user.id,
-      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
-    },
-    {
-      id: client.user.id,
-      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels],
-    },
-  ];
-  if (S().testerRoleId && i.guild.roles.cache.has(S().testerRoleId)) {
-    izinler.push({
-      id: S().testerRoleId,
-      allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory],
-    });
-  }
-
-  const kanalAdi = `test-${giris.nick}-${kit}`
-    .toLowerCase()
-    .replace(/[^a-z0-9-]/g, '-')
-    .slice(0, 90);
-  const kanal = await i.guild.channels.create({
-    name: kanalAdi,
-    type: ChannelType.GuildText,
-    parent: S().ticketCategoryId || null,
-    permissionOverwrites: izinler,
-  });
-
-  // Kanal başarıyla açıldı: şimdi kuyruktan düş ve kaydı tut
-  if (idx !== -1) state.queue.splice(idx, 1);
-  state.tickets[kanal.id] = { userId: uye.id, testerId: i.user.id, kit, nick: giris.nick, at: Date.now() };
-  kaydet();
-  panelGuncelle();
-
-  const embed = new EmbedBuilder()
-    .setTitle(`🧪 ${kit} Testi`)
-    .setColor(RENK.ana)
-    .addFields(
-      { name: 'Oyuncu', value: `${uye}`, inline: true },
-      { name: 'Tester', value: `${i.user}`, inline: true },
-      { name: 'Nick', value: `\`${giris.nick}\``, inline: true }
-    )
-    .setDescription('Test bitince tester `/tier-ver` ve ardından `/kapat` kullanacak.');
-  await kanal.send({ content: `${uye} test sırası sende!`, embeds: [embed] });
-  await logla(i.guild, `🧪 ${i.user.tag} → ${uye.user.tag} için **${kit}** testi başlattı (#${kanal.name}).`);
-
-  const sonraki = kuyrukListesi(kit)[0];
-  return i.editReply(
-    `Kanal açıldı: ${kanal}${sonraki ? `\nSıradaki oyuncu: <@${sonraki.userId}> (\`${sonraki.nick}\`)` : '\nKuyrukta başka kimse yok.'}`
-  );
+  return testAc(i, kit, i.options.getUser('oyuncu'));
 };
 
 komutlar['tier-ver'] = async (i) => {
@@ -753,48 +840,15 @@ komutlar.kapat = async (i) => {
   return i.channel.delete().catch((e) => console.log('Kanal silinemedi:', e.message));
 };
 
-komutlar.tester = async (i) => {
-  const sub = i.options.getSubcommand();
-  if (sub === 'aktif') {
-    const kit = kitBul(i.options.getString('kit'));
-    if (!kit) return i.reply({ content: '❌ Bu kit mevcut değil.', flags: GIZLI });
-    const mevcut = state.activeTesters[i.user.id] || [];
-    if (!mevcut.includes(kit)) mevcut.push(kit);
-    state.activeTesters[i.user.id] = mevcut;
-    kaydet();
-    panelGuncelle();
-    return i.reply({ content: `🟢 **${kit}** için aktif oldun. Aktif kitlerin: ${mevcut.join(', ')}`, flags: GIZLI });
-  }
-  if (sub === 'pasif') {
-    const kitAdi = i.options.getString('kit');
-    if (kitAdi) {
-      const kit = kitBul(kitAdi);
-      const kalan = (state.activeTesters[i.user.id] || []).filter((k) => k !== kit);
-      if (kalan.length) state.activeTesters[i.user.id] = kalan;
-      else delete state.activeTesters[i.user.id];
-    } else {
-      delete state.activeTesters[i.user.id];
-    }
-    kaydet();
-    panelGuncelle();
-    const kalanlar = state.activeTesters[i.user.id];
-    return i.reply({
-      content: kalanlar ? `🔴 Pasif oldun. Hâlâ aktif: ${kalanlar.join(', ')}` : '🔴 Tüm kitlerde pasif oldun.',
-      flags: GIZLI,
-    });
-  }
-  // liste
-  const satirlar = S()
-    .kits.map((kit) => {
-      const t = aktifTesterler(kit);
-      return t.length ? `**${kit}**: ${t.map((id) => `<@${id}>`).join(', ')}` : null;
-    })
-    .filter(Boolean);
-  return i.reply({
-    content: satirlar.length ? satirlar.join('\n') : 'Şu an aktif tester yok.',
-    flags: GIZLI,
-    allowedMentions: { parse: [] },
-  });
+komutlar['kuyruk-durum'] = async (i) => {
+  const kit = kitBul(i.options.getString('kit'));
+  if (!kit) return i.reply({ content: '❌ Bu kit mevcut değil.', flags: GIZLI });
+  const acik = i.options.getBoolean('acik');
+  state.kitOpen[kit] = acik;
+  kaydet();
+  panelGuncelle(kit);
+  await logla(i.guild, `${acik ? '🟢' : '🔴'} ${i.user.tag} **${kit}** kuyruğunu ${acik ? 'açtı' : 'kapattı'}.`);
+  return i.reply({ content: `**${kit}** kuyruğu ${acik ? 'açıldı 🟢' : 'kapatıldı 🔴'}.`, flags: GIZLI });
 };
 
 komutlar['kuyruk-at'] = async (i) => {
@@ -822,23 +876,44 @@ komutlar['cooldown-sifirla'] = async (i) => {
 };
 
 // ---------- Yönetici komutları ----------
-komutlar['panel-kur'] = async (i) => {
+komutlar['waitlist-kur'] = async (i) => {
   await i.deferReply({ flags: GIZLI });
   const kanal = i.options.getChannel('kanal') || i.channel;
-  // Eski panel varsa silmeyi dene
-  if (state.panel) {
+  await eskiMesajiSil(state.panels.waitlist);
+  const mesaj = await kanal.send({ embeds: [waitlistEmbed()], components: waitlistBilesenleri() });
+  state.panels.waitlist = { channelId: kanal.id, messageId: mesaj.id };
+  kaydet();
+  const eksikler = KITLER.filter((k) => !S().kitRoles[k]);
+  const uyari = eksikler.length
+    ? `\n⚠️ Rolü ayarlanmamış kitler: ${eksikler.join(', ')} (\`/ayar kit-rol\`)`
+    : '';
+  return i.editReply(`✅ WAITLIST paneli ${kanal} kanalına gönderildi.${uyari}`);
+};
+
+komutlar['kuyruk-panel-kur'] = async (i) => {
+  await i.deferReply({ flags: GIZLI });
+  const secili = kitBul(i.options.getString('kit'));
+  const kitler = secili ? [secili] : KITLER;
+  const sonuc = [];
+  for (const kit of kitler) {
+    const kanalId = S().kitChannels[kit];
+    if (!kanalId) {
+      sonuc.push(`⚠️ ${kit}: kanal ayarlı değil (\`/ayar kit-kanal\`)`);
+      continue;
+    }
     try {
-      const eskiKanal = await client.channels.fetch(state.panel.channelId);
-      const eskiMesaj = await eskiKanal.messages.fetch(state.panel.messageId);
-      await eskiMesaj.delete();
+      const kanal = await i.guild.channels.fetch(kanalId);
+      await eskiMesajiSil(state.panels.kits[kit]);
+      const mesaj = await kanal.send({ embeds: [kitPanelEmbed(kit)], components: kitPanelBilesenleri(kit) });
+      state.panels.kits[kit] = { channelId: kanal.id, messageId: mesaj.id };
+      sonuc.push(`✅ ${kit}: ${kanal}`);
     } catch (e) {
-      /* eski panel zaten yok */
+      sonuc.push(`❌ ${kit}: gönderilemedi (botun o kanalı görme/yazma izni var mı?)`);
     }
   }
-  const mesaj = await kanal.send({ embeds: [panelEmbed()], components: panelBilesenleri() });
-  state.panel = { channelId: kanal.id, messageId: mesaj.id };
   kaydet();
-  return i.editReply(`✅ Bekleme listesi paneli ${kanal} kanalına gönderildi. Otomatik güncellenir.`);
+  panelGuncelle();
+  return i.editReply(sonuc.join('\n'));
 };
 
 komutlar['kuyruk-temizle'] = async (i) => {
@@ -848,7 +923,7 @@ komutlar['kuyruk-temizle'] = async (i) => {
   state.queue = state.queue.filter((k) => k.kit !== kit);
   const silinen = onceki - state.queue.length;
   kaydet();
-  panelGuncelle();
+  panelGuncelle(kit);
   await logla(i.guild, `🧹 ${i.user.tag} **${kit}** kuyruğunu temizledi (${silinen} kişi).`);
   return i.reply({ content: `**${kit}** kuyruğu temizlendi (${silinen} kişi).`, flags: GIZLI });
 };
@@ -858,11 +933,17 @@ komutlar.ayar = async (i) => {
   const s = S();
   const tamam = (metin) => {
     kaydet();
+    panelGuncelle();
     return i.reply({ content: `✅ ${metin}`, flags: GIZLI });
   };
 
   switch (sub) {
     case 'goster': {
+      const kitSatirlari = KITLER.map((kit) => {
+        const rol = s.kitRoles[kit] ? `<@&${s.kitRoles[kit]}>` : 'rol yok';
+        const kanal = s.kitChannels[kit] ? `<#${s.kitChannels[kit]}>` : 'kanal yok';
+        return `**${kit}**: ${rol} • ${kanal} • ${kitAcikMi(kit) ? '🟢' : '🔴'}`;
+      }).join('\n');
       const embed = new EmbedBuilder()
         .setTitle('⚙️ Bot Ayarları')
         .setColor(RENK.gri)
@@ -873,10 +954,14 @@ komutlar.ayar = async (i) => {
           { name: 'Test kategorisi', value: s.ticketCategoryId ? `<#${s.ticketCategoryId}>` : 'Ayarlı değil', inline: true },
           { name: 'Cooldown', value: s.cooldownDays ? `${s.cooldownDays} gün` : 'Kapalı', inline: true },
           { name: 'Kit başına kuyruk', value: String(s.maxQueue), inline: true },
-          { name: 'Otomatik rol', value: s.autoRole ? 'Açık' : 'Kapalı', inline: true },
-          { name: 'Rol eşlemeleri', value: String(Object.keys(s.roleMap).length), inline: true },
-          { name: 'Panel', value: state.panel ? `<#${state.panel.channelId}>` : 'Kurulmadı (/panel-kur)', inline: true },
-          { name: `Kitler (${s.kits.length})`, value: s.kits.join(', ') }
+          { name: 'Otomatik tier rolü', value: s.autoRole ? 'Açık' : 'Kapalı', inline: true },
+          { name: 'Tier rol eşlemeleri', value: String(Object.keys(s.roleMap).length), inline: true },
+          {
+            name: 'WAITLIST paneli',
+            value: state.panels.waitlist ? `<#${state.panels.waitlist.channelId}>` : 'Kurulmadı',
+            inline: true,
+          },
+          { name: 'Kitler (WAITLIST rolü • kuyruk kanalı • durum)', value: kitSatirlari }
         );
       return i.reply({ embeds: [embed], flags: GIZLI });
     }
@@ -900,6 +985,22 @@ komutlar.ayar = async (i) => {
       s.ticketCategoryId = kategori.id;
       return tamam(`Test kanalları **${kategori.name}** kategorisinde açılacak.`);
     }
+    case 'kit-rol': {
+      const kit = kitBul(i.options.getString('kit'));
+      const rol = i.options.getRole('rol');
+      if (!kit) return i.reply({ content: '❌ Bu kit mevcut değil.', flags: GIZLI });
+      s.kitRoles[kit] = rol.id;
+      return tamam(`**${kit}** WAITLIST rolü ${rol} olarak ayarlandı.`);
+    }
+    case 'kit-kanal': {
+      const kit = kitBul(i.options.getString('kit'));
+      const kanal = i.options.getChannel('kanal');
+      if (!kit) return i.reply({ content: '❌ Bu kit mevcut değil.', flags: GIZLI });
+      s.kitChannels[kit] = kanal.id;
+      return tamam(
+        `**${kit}** kuyruk kanalı ${kanal} olarak ayarlandı. Paneli göndermek için \`/kuyruk-panel-kur\` kullan.`
+      );
+    }
     case 'cooldown': {
       s.cooldownDays = i.options.getInteger('gun');
       return tamam(s.cooldownDays ? `Cooldown **${s.cooldownDays} gün** oldu.` : 'Cooldown kapatıldı.');
@@ -912,37 +1013,9 @@ komutlar.ayar = async (i) => {
       s.autoRole = i.options.getBoolean('durum');
       return tamam(
         s.autoRole
-          ? 'Otomatik rol **açıldı**. Bot sadece var olan rolleri verir, rol oluşturmaz.'
-          : 'Otomatik rol **kapatıldı**. Roller elle verilecek.'
+          ? 'Otomatik tier rolü **açıldı**. Bot sadece var olan rolleri verir, rol oluşturmaz.'
+          : 'Otomatik tier rolü **kapatıldı**. Tier rolleri elle verilecek.'
       );
-    }
-    case 'kit-ekle': {
-      const isim = i.options.getString('isim').trim();
-      if (!KIT_REGEX.test(isim)) {
-        return i.reply({ content: '❌ Kit adı sadece harf, rakam, boşluk, _ + - içerebilir (en fazla 20).', flags: GIZLI });
-      }
-      if (kitBul(isim)) return i.reply({ content: '❌ Bu kit zaten var.', flags: GIZLI });
-      if (s.kits.length >= 25) return i.reply({ content: '❌ En fazla 25 kit eklenebilir.', flags: GIZLI });
-      s.kits.push(isim);
-      panelGuncelle();
-      return tamam(`**${isim}** kiti eklendi.`);
-    }
-    case 'kit-sil': {
-      const kit = kitBul(i.options.getString('kit'));
-      if (!kit) return i.reply({ content: '❌ Bu kit mevcut değil.', flags: GIZLI });
-      if (s.kits.length <= 1) return i.reply({ content: '❌ En az 1 kit kalmalı.', flags: GIZLI });
-      s.kits = s.kits.filter((k) => k !== kit);
-      state.queue = state.queue.filter((k) => k.kit !== kit);
-      for (const anahtar of Object.keys(s.roleMap)) {
-        if (anahtar.startsWith(`${kit}:`)) delete s.roleMap[anahtar];
-      }
-      for (const [id, kitler] of Object.entries(state.activeTesters)) {
-        const kalan = kitler.filter((k) => k !== kit);
-        if (kalan.length) state.activeTesters[id] = kalan;
-        else delete state.activeTesters[id];
-      }
-      panelGuncelle();
-      return tamam(`**${kit}** kiti silindi (kuyruğu ve rol eşlemeleri de temizlendi).`);
     }
     case 'rol-esle': {
       const kit = kitBul(i.options.getString('kit'));
@@ -964,18 +1037,18 @@ komutlar.ayar = async (i) => {
     case 'rol-kontrol': {
       const eksik = [];
       let bulunan = 0;
-      for (const kit of s.kits) {
+      for (const kit of KITLER) {
         for (const tier of TIERLER) {
           if (tierRoluBul(i.guild, kit, tier)) bulunan += 1;
           else eksik.push(`${kit} ${tier}`);
         }
       }
-      const toplam = s.kits.length * TIERLER.length;
-      let metin = `Bulunan rol: **${bulunan} / ${toplam}**`;
+      const toplam = KITLER.length * TIERLER.length;
+      let metin = `Bulunan tier rolü: **${bulunan} / ${toplam}**`;
       if (eksik.length) {
         let liste = eksik.join(', ');
         if (liste.length > 1500) liste = `${liste.slice(0, 1500)}...`;
-        metin += `\nEksik: ${liste}\nRolleri \`/ayar rol-esle\` ile eşleyebilirsin (ya da "Kit Tier" adıyla adlandır).`;
+        metin += `\nEksik: ${liste}\nRolleri \`/ayar rol-esle\` ile eşleyebilirsin (ya da "KIT TIER" adıyla adlandır).`;
       }
       return i.reply({ content: metin, flags: GIZLI });
     }
@@ -985,24 +1058,43 @@ komutlar.ayar = async (i) => {
 };
 
 // --------------------------------------------------------------------------
-//  9) PANEL ETKİLEŞİMLERİ (menü, buton, pencere)
+//  10) BUTON VE PENCERE İŞLEYİCİLERİ
 // --------------------------------------------------------------------------
-async function panelSecim(i) {
-  const kit = kitBul(i.values[0]);
-  if (!kit) return i.reply({ content: '❌ Bu kit artık mevcut değil.', flags: GIZLI });
-  const cd = cooldownKalan(i.user.id, kit);
-  if (cd) return i.reply({ content: `⏳ **${kit}** için cooldown'dasın. Tekrar test: ${zaman(cd)}`, flags: GIZLI });
-  const sira = siraBul(i.user.id, kit);
-  if (sira) return i.reply({ content: `Zaten **${kit}** kuyruğundasın (sıra: **${sira}**).`, flags: GIZLI });
+// WAITLIST: kit rolünü ver / kaldır
+async function waitlistRolToggle(i, kit) {
+  await i.deferReply({ flags: GIZLI });
+  const rolId = S().kitRoles[kit];
+  const rol = rolId ? i.guild.roles.cache.get(rolId) : null;
+  if (!rol) {
+    return i.editReply(`❌ **${kit}** için WAITLIST rolü ayarlanmamış. Bir yöneticiye haber ver (\`/ayar kit-rol\`).`);
+  }
+  const kanalNotu = S().kitChannels[kit] ? ` <#${S().kitChannels[kit]}> kanalını artık görebilirsin.` : '';
+  try {
+    if (i.member.roles.cache.has(rol.id)) {
+      await i.member.roles.remove(rol);
+      kuyruktanCikar(i.user.id, kit); // rol gidince kuyruktan da çık
+      return i.editReply(`➖ **${kit}** rolü kaldırıldı, kuyruk kanalına erişimin kapandı.`);
+    }
+    await i.member.roles.add(rol);
+    return i.editReply(`✅ **${kit}** rolünü aldın.${kanalNotu}\nSıraya girmek için kanaldaki **KATIL** butonunu kullan.`);
+  } catch (e) {
+    console.log('WAITLIST rol hatası:', e.message);
+    return i.editReply('❌ Rol işlemi yapılamadı. Botun rolü bu rolün üstünde olmalı ve **Rolleri Yönet** izni olmalı.');
+  }
+}
 
+// KATIL: önce kontrol, sonra Minecraft adı penceresi
+async function kuyrukKatilButon(i, kit) {
+  const hata = kuyrukHata(i.member, kit);
+  if (hata) return i.reply({ content: hata, flags: GIZLI });
   const modal = new ModalBuilder()
-    .setCustomId(`wl_nick:${kit}`)
-    .setTitle(`${kit} - Kuyruğa Gir`)
+    .setCustomId(`q_nick:${kit}`)
+    .setTitle(`${kit} - Kuyruğa Katıl`)
     .addComponents(
       new ActionRowBuilder().addComponents(
         new TextInputBuilder()
           .setCustomId('nick')
-          .setLabel('Minecraft Nicki')
+          .setLabel('Minecraft Adın')
           .setStyle(TextInputStyle.Short)
           .setMinLength(3)
           .setMaxLength(16)
@@ -1012,34 +1104,70 @@ async function panelSecim(i) {
   return i.showModal(modal);
 }
 
-async function panelModal(i) {
-  const kit = i.customId.slice('wl_nick:'.length);
+async function nickPenceresi(i) {
+  const kit = kitBul(i.customId.slice('q_nick:'.length));
+  if (!kit) return i.reply({ content: '❌ Bu kit mevcut değil.', flags: GIZLI });
   const nick = i.fields.getTextInputValue('nick').trim();
-  const sonuc = kuyrugaEkle(i.user.id, kit, nick);
+  const sonuc = kuyrugaEkle(i.member, kit, nick);
   return i.reply({ content: sonuc.msg, flags: GIZLI });
 }
 
-async function panelButon(i) {
-  if (i.customId === 'wl_leave') {
-    const onceki = state.queue.length;
-    state.queue = state.queue.filter((k) => k.userId !== i.user.id);
-    const silinen = onceki - state.queue.length;
-    if (silinen) {
-      kaydet();
-      panelGuncelle();
+const BUTON_TURLERI = new Set(['wl_rol', 'q_join', 'q_leave', 'q_toggle', 'q_next', 'q_clear']);
+
+async function butonIsle(i) {
+  const [tur, kitAdi] = i.customId.split(':');
+  if (!BUTON_TURLERI.has(tur)) return;
+  const kit = kitBul(kitAdi);
+  if (!kit) return i.reply({ content: '❌ Bu kit artık mevcut değil.', flags: GIZLI });
+
+  switch (tur) {
+    case 'wl_rol':
+      return waitlistRolToggle(i, kit);
+    case 'q_join':
+      return kuyrukKatilButon(i, kit);
+    case 'q_leave': {
+      const cikti = kuyruktanCikar(i.user.id, kit);
+      return i.reply({
+        content: cikti ? `**${kit}** kuyruğundan çıkarıldın.` : `**${kit}** kuyruğunda değilsin.`,
+        flags: GIZLI,
+      });
     }
-    return i.reply({
-      content: silinen ? `${silinen} kuyruktan çıkarıldın.` : 'Hiçbir kuyrukta değilsin.',
-      flags: GIZLI,
-    });
+    default:
+      break;
   }
-  if (i.customId === 'wl_pos') {
-    return komutlar.siram(i);
+
+  // Buradan sonrası YÖNETİM butonları: sadece tester / yönetici
+  if (!testerMi(i.member)) {
+    return i.reply({ content: '🔒 Bu buton sadece testerlar ve yöneticiler için.', flags: GIZLI });
+  }
+
+  if (tur === 'q_toggle') {
+    state.kitOpen[kit] = !kitAcikMi(kit);
+    kaydet();
+    panelGuncelle(); // WAITLIST panelindeki durum da güncellensin
+    await logla(
+      i.guild,
+      `${kitAcikMi(kit) ? '🟢' : '🔴'} ${i.user.tag} **${kit}** kuyruğunu ${kitAcikMi(kit) ? 'açtı' : 'kapattı'}.`
+    );
+    return i.update({ embeds: [kitPanelEmbed(kit)], components: kitPanelBilesenleri(kit) });
+  }
+  if (tur === 'q_next') {
+    await i.deferReply({ flags: GIZLI });
+    return testAc(i, kit, null);
+  }
+  if (tur === 'q_clear') {
+    const onceki = state.queue.length;
+    state.queue = state.queue.filter((k) => k.kit !== kit);
+    const silinen = onceki - state.queue.length;
+    kaydet();
+    panelGuncelle(kit);
+    await logla(i.guild, `🧹 ${i.user.tag} **${kit}** kuyruğunu temizledi (${silinen} kişi).`);
+    return i.reply({ content: `**${kit}** kuyruğu temizlendi (${silinen} kişi).`, flags: GIZLI });
   }
 }
 
 // --------------------------------------------------------------------------
-//  10) İSTEMCİ VE OLAYLAR
+//  11) İSTEMCİ VE OLAYLAR
 // --------------------------------------------------------------------------
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -1056,15 +1184,6 @@ async function komutCalistir(i) {
   return fn(i);
 }
 
-async function otomatikTamamla(i) {
-  const odak = i.options.getFocused().toLowerCase();
-  const liste = S()
-    .kits.filter((k) => k.toLowerCase().includes(odak))
-    .slice(0, 25)
-    .map((k) => ({ name: k, value: k }));
-  return i.respond(liste);
-}
-
 async function hataYanit(i, err) {
   console.error('Etkileşim hatası:', err);
   const msg = '❌ Bir hata oluştu. Botun izinlerini (Rolleri/Kanalları Yönet) ve ayarları kontrol et.';
@@ -1078,17 +1197,15 @@ async function hataYanit(i, err) {
 
 client.on('interactionCreate', async (i) => {
   try {
-    if (i.isAutocomplete()) return await otomatikTamamla(i);
     if (i.isChatInputCommand()) return await komutCalistir(i);
-    if (i.isStringSelectMenu() && i.customId === 'wl_join') return await panelSecim(i);
-    if (i.isButton()) return await panelButon(i);
-    if (i.isModalSubmit() && i.customId.startsWith('wl_nick:')) return await panelModal(i);
+    if (i.isButton()) return await butonIsle(i);
+    if (i.isModalSubmit() && i.customId.startsWith('q_nick:')) return await nickPenceresi(i);
   } catch (err) {
     await hataYanit(i, err);
   }
 });
 
-// Silinen test kanallarının kaydını temizle (elle silinirse)
+// Elle silinen test kanallarının kaydını temizle
 client.on('channelDelete', (kanal) => {
   if (state.tickets[kanal.id]) {
     delete state.tickets[kanal.id];
@@ -1130,7 +1247,7 @@ process.on('SIGTERM', () => {
 });
 
 // --------------------------------------------------------------------------
-//  11) RENDER İÇİN KÜÇÜK HTTP SUNUCUSU (UptimeRobot buraya ping atar)
+//  12) RENDER İÇİN KÜÇÜK HTTP SUNUCUSU (UptimeRobot buraya ping atar)
 // --------------------------------------------------------------------------
 http
   .createServer((req, res) => res.end('Bot calisiyor'))
