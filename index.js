@@ -30,6 +30,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  StringSelectMenuBuilder,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -43,7 +44,10 @@ if (!DISCORD_TOKEN || !GUILD_ID) {
 }
 
 // Kit listesini istediğin gibi değiştirebilirsin (en fazla 25)
-const KITLER = ['NETPOT', 'SWORD', 'SMP', 'CPVP', 'MACE', 'AXE', 'UHC'];
+const KITLER = ['NETPOT', 'SMP', 'SWORD', 'AXE', 'CPVP', 'MACE', 'UHC'];
+// Menüde ve rol adlarında görünen isimler ("Netpot Waitlist" gibi)
+const KIT_AD = { NETPOT: 'Netpot', SMP: 'SMP', SWORD: 'Sword', AXE: 'Axe', CPVP: 'CPVP', MACE: 'Mace', UHC: 'UHC' };
+const kitAdi = (kit) => KIT_AD[kit] || kit;
 const TIERLER = ['HT1', 'LT1', 'HT2', 'LT2', 'HT3', 'LT3', 'HT4', 'LT4', 'HT5', 'LT5'];
 const RENK = { ana: 0x5865f2, basari: 0x2ecc71, uyari: 0xf1c40f, hata: 0xe74c3c, gri: 0x95a5a6 };
 const TIER_RENK = { 1: 0xf1c40f, 2: 0xe67e22, 3: 0x3498db, 4: 0x2ecc71, 5: 0x95a5a6 };
@@ -278,40 +282,30 @@ function kuyrukTemizle(kit) {
 //  PANELLER
 // --------------------------------------------------------------------------
 function waitlistEmbed() {
-  const embed = new EmbedBuilder()
-    .setTitle('📋 WAITLIST')
+  return new EmbedBuilder()
+    .setTitle('WAITLIST')
     .setColor(RENK.ana)
     .setDescription(
-      '**Nasıl çalışır?**\n' +
-        '1️⃣ Test olmak istediğin kitin butonuna bas.\n' +
-        '2️⃣ Kitin **özel kuyruk kanalı** sana açılır.\n' +
-        '3️⃣ O kanaldaki **KATIL** butonuyla Minecraft adını girip sıraya gir.\n\n' +
-        'Aynı anda birden fazla kite girebilirsin. Butona tekrar basarsan o kitten ayrılırsın.'
-    )
-    .setFooter({ text: 'Son güncelleme' })
-    .setTimestamp();
-  for (const kit of KITLER) {
-    const kanalId = S().kitChannels[kit];
-    embed.addFields({
-      name: kit,
-      value:
-        `${kanalId ? `<#${kanalId}>` : '`kanal yok`'}\n` +
-        `${kitAcikMi(kit) ? '🟢 Açık' : '🔴 Kapalı'} • 👥 ${kuyrukListesi(kit).length}`,
-      inline: true,
-    });
-  }
-  return embed;
+      'Test olmak istediğin kitin **Waitlist** rolünü aşağıdaki menüden seç.\n' +
+        'Rolü aldığında o kitin kuyruk kanalı sana açılır. Orada **KATIL** butonuna basıp Minecraft adını girerek sıraya girebilirsin.\n\n' +
+        'Birden fazla kit seçebilirsin. Menüde seçili olmayan kitlerin rolü sende kalmaz.'
+    );
 }
 
 function waitlistBilesenleri() {
-  const butonlar = KITLER.map((kit) =>
-    new ButtonBuilder().setCustomId(`wl:${kit}`).setLabel(kit).setStyle(ButtonStyle.Primary)
-  );
-  const satirlar = [];
-  for (let n = 0; n < butonlar.length; n += 5) {
-    satirlar.push(new ActionRowBuilder().addComponents(butonlar.slice(n, n + 5)));
-  }
-  return satirlar;
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId('wl_menu')
+    .setPlaceholder('Waitlist seç...')
+    .setMinValues(0)
+    .setMaxValues(KITLER.length)
+    .addOptions(
+      KITLER.map((kit) => ({
+        label: `${kitAdi(kit)} Waitlist`,
+        value: kit,
+        description: kitAcikMi(kit) ? `Açık • ${kuyrukListesi(kit).length} kişi bekliyor` : 'Kuyruk kapalı',
+      }))
+    );
+  return [new ActionRowBuilder().addComponents(menu)];
 }
 
 function kitPanelEmbed(kit) {
@@ -832,7 +826,7 @@ komutlar.kurulum = async (i) => {
 
     // Her kit için: WAITLIST rolü + özel kuyruk kanalı
     for (const kit of KITLER) {
-      const rol = await rolBulVeyaOlustur(g, `${kit} Waitlist`);
+      const rol = await rolBulVeyaOlustur(g, `${kitAdi(kit)} Waitlist`);
       s.kitRoles[kit] = rol.id;
       const kanal = await kanalBulVeyaOlustur(g, `${kit.toLowerCase()}-kuyruk`, ChannelType.GuildText, kuyrukKat.id, [
         { id: g.id, deny: [P.ViewChannel] },
@@ -986,28 +980,43 @@ komutlar.ayar = async (i) => {
 // --------------------------------------------------------------------------
 //  BUTONLAR VE PENCERE
 // --------------------------------------------------------------------------
-// WAITLIST: kit rolünü ver (kanal açılır) / kaldır
-async function waitlistButon(i, kit) {
+// WAITLIST menüsü: seçilen kitlerin rolü verilir, seçilmeyenlerin rolü alınır
+async function waitlistSecim(i) {
   await i.deferReply({ flags: GIZLI });
-  const rolId = S().kitRoles[kit];
-  const rol = rolId ? i.guild.roles.cache.get(rolId) : null;
-  if (!rol) return i.editReply(`❌ **${kit}** için WAITLIST rolü yok. Bir yönetici \`/kurulum\` çalıştırmalı.`);
-  const kanalId = S().kitChannels[kit];
-  try {
-    if (i.member.roles.cache.has(rol.id)) {
-      await i.member.roles.remove(rol);
-      kuyruktanCikar(i.user.id, kit);
-      return i.editReply(`➖ **${kit}** waitlist'inden ayrıldın, kanal erişimin kapandı.`);
+  const secilen = new Set(i.values);
+  const eklenecek = [];
+  const alinacak = [];
+  const eksik = [];
+  for (const kit of KITLER) {
+    const rolId = S().kitRoles[kit];
+    const rol = rolId ? i.guild.roles.cache.get(rolId) : null;
+    if (!rol) {
+      if (secilen.has(kit)) eksik.push(kitAdi(kit));
+      continue;
     }
-    await i.member.roles.add(rol);
-    return i.editReply(
-      `✅ **${kit}** waitlist'ine girdin.\n` +
-        (kanalId ? `👉 Kuyruk kanalın: <#${kanalId}>\nOrada **KATIL** butonuna basıp Minecraft adını gir.` : 'Kuyruk kanalı henüz ayarlanmamış.')
-    );
+    const var_ = i.member.roles.cache.has(rol.id);
+    if (secilen.has(kit) && !var_) eklenecek.push({ kit, rol });
+    if (!secilen.has(kit) && var_) alinacak.push({ kit, rol });
+  }
+  try {
+    if (eklenecek.length) await i.member.roles.add(eklenecek.map((x) => x.rol));
+    if (alinacak.length) {
+      await i.member.roles.remove(alinacak.map((x) => x.rol));
+      alinacak.forEach((x) => kuyruktanCikar(i.user.id, x.kit));
+    }
   } catch (e) {
     console.log('WAITLIST rol hatası:', e.message);
-    return i.editReply('❌ Rol verilemedi. Botun rolü, WAITLIST rolünün üstünde olmalı ve **Rolleri Yönet** izni olmalı.');
+    return i.editReply('❌ Rol verilemedi. Botun rolü, Waitlist rollerinin üstünde olmalı ve **Rolleri Yönet** izni olmalı.');
   }
+  const aktif = KITLER.filter((kit) => secilen.has(kit) && !eksik.includes(kitAdi(kit)));
+  let metin = aktif.length
+    ? '✅ **Waitlist\'lerin:**\n' +
+      aktif.map((kit) => `• **${kitAdi(kit)}** → ${S().kitChannels[kit] ? `<#${S().kitChannels[kit]}>` : 'kanal yok'}`).join('\n') +
+      '\nKanala gidip **KATIL** butonuna bas.'
+    : 'Hiçbir waitlist\'te değilsin.';
+  if (alinacak.length) metin += `\n➖ Ayrıldın: ${alinacak.map((x) => kitAdi(x.kit)).join(', ')}`;
+  if (eksik.length) metin += `\n⚠️ Rolü olmayan kitler: ${eksik.join(', ')} (bir yönetici \`/kurulum\` çalıştırmalı)`;
+  return i.editReply(metin);
 }
 
 async function katilButon(i, kit) {
@@ -1036,7 +1045,7 @@ async function nickPenceresi(i) {
   return i.reply({ content: sonuc.msg, flags: GIZLI });
 }
 
-const BUTON_TURLERI = new Set(['wl', 'q_join', 'q_leave', 'q_toggle', 'q_next', 'q_clear']);
+const BUTON_TURLERI = new Set(['q_join', 'q_leave', 'q_toggle', 'q_next', 'q_clear']);
 
 async function butonIsle(i) {
   const [tur, kitAdi] = i.customId.split(':');
@@ -1044,7 +1053,6 @@ async function butonIsle(i) {
   const kit = kitBul(kitAdi);
   if (!kit) return i.reply({ content: '❌ Bu kit artık mevcut değil.', flags: GIZLI });
 
-  if (tur === 'wl') return waitlistButon(i, kit);
   if (tur === 'q_join') return katilButon(i, kit);
   if (tur === 'q_leave') {
     const cikti = kuyruktanCikar(i.user.id, kit);
@@ -1103,6 +1111,7 @@ client.on(Events.InteractionCreate, async (i) => {
   try {
     if (i.isChatInputCommand()) return await komutCalistir(i);
     if (i.isButton()) return await butonIsle(i);
+    if (i.isStringSelectMenu() && i.customId === 'wl_menu') return await waitlistSecim(i);
     if (i.isModalSubmit() && i.customId.startsWith('q_nick:')) return await nickPenceresi(i);
   } catch (err) {
     await hataYanit(i, err);
