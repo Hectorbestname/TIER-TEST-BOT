@@ -1,17 +1,18 @@
 {
-  "name": "tier-waitlist-bot",
-  "version": "1.0.0",
-  "description": "Minecraft PvP tier, waitlist and queue bot",
+  "name": "harlem-tierlist-bot",
+  "version": "2.0.0",
+  "description": "Minecraft PvP tier testing, WAITLIST roles, per-kit queues and test session management bot",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "check": "node --check index.js"
   },
   "engines": {
     "node": "22.x"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",
-    "discord.js": "^14.22.1",
+    "discord.js": "14.27.0",
     "dotenv": "^16.4.7"
   }
 }
